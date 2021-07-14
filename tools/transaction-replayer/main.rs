@@ -60,7 +60,7 @@ use cfx_statedb::StateDb;
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
-    StateIndex
+    StateIndex,
 };
 use cfx_parameters::{
     consensus::{
@@ -117,6 +117,8 @@ fn main() {
     let address_path = format!("{}/address.txt", dir);
     let trace_file = File::open(trace_path).unwrap();
     let mut trace_reader = BufReader::new(trace_file);
+
+    let addresses = read_addresses(&address_path);
 
     let storage_manager = Arc::new(
         StorageManager::new(conf.storage_config())
@@ -216,7 +218,7 @@ fn main() {
     state.commit(H256::random(), None).unwrap();
     commit_time += now.elapsed();
 
-    if check_balance(&state, &data_man, last_epoch_number, &address_path) {
+    if check_balance(&state, &data_man, last_epoch_number, &addresses) {
         return;
     }
 
@@ -239,11 +241,9 @@ fn check_balance(
     state: &State,
     data_man: &BlockDataManager,
     epoch_height: u64,
-    address_path: &str
+    addresses: &Vec<Address>
 ) -> bool
 {
-    let address_file = File::open(address_path).unwrap();
-    let mut address_reader = BufReader::new(address_file);
     let epoch_hashes = data_man.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
     let epoch_id = epoch_hashes.last().unwrap();
     let ori_state = State::new(StateDb::new(
@@ -254,16 +254,10 @@ fn check_balance(
             false
         ).unwrap().unwrap()
     )).unwrap();
-    let mut line = String::new();
     let mut wrong = false;
-    while let Ok(_) = address_reader.read_line(&mut line) {
-        if line.len() == 0 {
-            break;
-        }
-        let address: Address = line.parse().unwrap();
-        line.clear();
-        let ori_balance = ori_state.balance(&address).unwrap();
-        let cur_balance = state.balance(&address).unwrap();
+    for address in addresses {
+        let ori_balance = ori_state.balance(address).unwrap();
+        let cur_balance = state.balance(address).unwrap();
         if ori_balance != cur_balance {
             println!("Error: epoch_height {}, address {:x}: ori_balance = {}, cur_balance = {}",
                 epoch_height, address, ori_balance, cur_balance);
@@ -580,4 +574,20 @@ fn genesis_state(
     //     serde_json::to_string(&debug_record).unwrap()
     // );
     (genesis, state)
+}
+
+fn read_addresses(address_path: &str) -> Vec<Address> {
+    let address_file = File::open(address_path).unwrap();
+    let mut address_reader = BufReader::new(address_file);
+    let mut ret = Vec::new();
+    let mut line = String::new();
+    while let Ok(_) = address_reader.read_line(&mut line) {
+        if line.len() == 0 {
+            break;
+        }
+        let address: Address = line.parse().unwrap();
+        line.clear();
+        ret.push(address);
+    }
+    ret
 }
