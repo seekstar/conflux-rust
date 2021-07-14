@@ -437,7 +437,7 @@ pub fn genesis_block(
     genesis
 }
 
-fn execute_genesis_transaction(
+pub fn execute_genesis_transaction(
     transaction: &SignedTransaction, state: &mut State, machine: Arc<Machine>,
 ) {
     let env = Env::default();

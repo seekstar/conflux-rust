@@ -26,10 +26,11 @@
 
 use cfx_types::{Address, H256, U256};
 use primitives::BlockNumber;
+use serde::{Deserialize, Serialize};
 
 /// Information concerning the execution environment for a
 /// message-call/contract-creation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Env {
     /// The block number.
     pub number: BlockNumber,

@@ -52,6 +52,10 @@ parity-wordlist = "1.3.0"
 rustc-hex = "2.1"
 env_logger = "0.5"
 malloc_size_of = {path="util/malloc_size_of"}
+cfx-statedb = { path = "core/statedb" }
+cfx-storage = { path = "core/storage" }
+cfx-parameters = { path = "core/parameters" }
+cfx-state = { path = "core/state" }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies.jemallocator]
 version = "0.3.2"
@@ -72,6 +76,14 @@ path = "accounts/cfxkey/cli/src/main.rs"
 [[bin]]
 name = "tg_config_gen"
 path = "tools/tg_config_gen/main.rs"
+
+[[bin]]
+name = "transaction-exporter"
+path = "tools/transaction-exporter/main.rs"
+
+[[bin]]
+name = "transaction-replayer"
+path = "tools/transaction-replayer/main.rs"
 
 # Use workspace section to allow test all cases under root folder (cargo test --all).
 [workspace]
@@ -95,3 +107,4 @@ overflow-checks = true
 overflow-checks = true
 # Temporarily run with debug assertion before main-net release.
 debug-assertions = true
+debug = true
