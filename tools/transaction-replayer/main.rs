@@ -56,7 +56,7 @@ use cfx_state::{
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::StateDb;
+use cfx_statedb::{StateDb/*, StateDbGetOriginalMethods*/};
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
@@ -109,7 +109,8 @@ fn main() {
                 .takes_value(true)
                 .default_value("100"),
         ).get_matches();
-    let conf = Configuration::parse(&arg_matches).unwrap();
+    let mut conf = Configuration::parse(&arg_matches).unwrap();
+    conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
     let commit_interval: usize =
         arg_matches.value_of("commit-interval").unwrap().parse().unwrap();
@@ -120,13 +121,104 @@ fn main() {
 
     let addresses = read_addresses(&address_path);
 
+    let (data_man_ori, _, _, _) = open_db(&conf);
+    conf.raw_conf.conflux_data_dir = "./replay_data".into();
+    let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
+
+    let mut transaction_executed: usize = 0;
+    let mut transact_time = Duration::from_secs(0);
+    let mut commit_time = Duration::from_secs(0);
+    let mut height = 0;
+    next_state(&mut state, &data_man_replay, &genesis_block.hash(), &mut height);
+
+    let mut not_executed_drop_cnt = 0;
+    let mut not_executed_to_reconsider_packing_cnt = 0;
+    let mut execution_error_bump_nonce_cnt = 0;
+    let mut finished_cnt = 0;
+
+    let mut line = String::new();
+    let mut last_epoch_number = 0;
+    while let Ok(_) = trace_reader.read_line(&mut line) {
+        if line.len() == 0 {
+            break;
+        }
+        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
+        for block_trace in epoch_trace.block_traces {
+            for transaction in block_trace.transactions {
+                let now = Instant::now();
+                let exe_res = Executive::new(
+                    &mut state,
+                    &block_trace.env,
+                    machine.as_ref(),
+                    &machine.spec(block_trace.env.number),
+                ).transact(&transaction, TransactOptions::with_no_tracing());
+                transact_time += now.elapsed();
+                let exe_res = exe_res.unwrap();
+                match exe_res
+                {
+                    ExecutionOutcome::NotExecutedDrop(_) => {
+                        not_executed_drop_cnt += 1;
+                    }
+                    ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
+                        not_executed_to_reconsider_packing_cnt += 1;
+                    }
+                    ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
+                        execution_error_bump_nonce_cnt += 1;
+                    }
+                    ExecutionOutcome::Finished(_) => {
+                        finished_cnt += 1;
+                    }
+                }
+                transaction_executed += 1;
+                if transaction_executed == commit_interval {
+                    transaction_executed = 0;
+                    commit_state(&mut state, &data_man_replay, &H256::random(), &mut height, &mut commit_time);
+                }
+            }
+        }
+        let mut merged_rewards = HashMap::new();
+        for reward in epoch_trace.rewards {
+            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
+        }
+        for reward in merged_rewards {
+            state.add_balance(&reward.0, &reward.1, CleanupMode::ForceCreate, U256::zero()).unwrap();
+        }
+        line.clear();
+        last_epoch_number += 1;
+    }
+    let now = Instant::now();
+    state.commit(H256::random(), None).unwrap();
+    commit_time += now.elapsed();
+
+    if check_state(&state, &data_man_ori, last_epoch_number, &addresses) {
+        return;
+    }
+
+    println!("NotExecutedDrop: {}\n\
+        NotExecutedToReconsiderPacking: {}\n\
+        ExecutionErrorBumpNonce: {}\n\
+        Finished: {}",
+        not_executed_drop_cnt,
+        not_executed_to_reconsider_packing_cnt,
+        execution_error_bump_nonce_cnt,
+        finished_cnt
+    );
+    println!("transact_time: {} ms\n\
+        commit_time: {} ms",
+        transact_time.as_millis(),
+        commit_time.as_millis());
+}
+
+fn open_db(conf: &Configuration)
+    -> (BlockDataManager, State, Block, Arc<Machine>)
+{
     let storage_manager = Arc::new(
         StorageManager::new(conf.storage_config())
             .expect("Failed to initialize storage."),
     );
     let vm = VmFactory::new(1024 * 32);
     let machine = Arc::new(new_machine_with_builtin(conf.common_params(), vm));
-    let (genesis_block, mut state) = genesis_state(
+    let (genesis_block, state) = genesis_state(
         &storage_manager,
         Address::from_str(GENESIS_VERSION).unwrap(),
         U256::zero(),
@@ -154,103 +246,23 @@ fn main() {
         conf.data_mananger_config(),
         pow.clone(),
     );
-    let mut transaction_executed: usize = 0;
-    let mut transact_time = Duration::from_secs(0);
-    let mut commit_time = Duration::from_secs(0);
-    let mut height = 0;
-    next_state(&mut state, &data_man, &genesis_block.hash(), &mut height);
-
-    let mut not_executed_drop_cnt = 0;
-    let mut not_executed_to_reconsider_packing_cnt = 0;
-    let mut execution_error_bump_nonce_cnt = 0;
-    let mut finished_cnt = 0;
-
-    let mut line = String::new();
-    let mut last_epoch_number = 0;
-    while let Ok(_) = trace_reader.read_line(&mut line) {
-        if line.len() == 0 {
-            break;
-        }
-        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
-        for block_trace in epoch_trace.block_traces {
-            for transaction in block_trace.transactions {
-                let now = Instant::now();
-                let exe_res = Executive::new(
-                    &mut state,
-                    &block_trace.env,
-                    machine.as_ref(),
-                    &machine.spec(block_trace.env.number),
-                ).transact(&transaction, TransactOptions::with_no_tracing());
-                transact_time += now.elapsed();
-                match exe_res.unwrap()
-                {
-                    ExecutionOutcome::NotExecutedDrop(_) => {
-                        not_executed_drop_cnt += 1;
-                    }
-                    ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
-                        not_executed_to_reconsider_packing_cnt += 1;
-                    }
-                    ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
-                        execution_error_bump_nonce_cnt += 1;
-                    }
-                    ExecutionOutcome::Finished(_) => {
-                        finished_cnt += 1;
-                    }
-                }
-                transaction_executed += 1;
-                if transaction_executed == commit_interval {
-                    transaction_executed = 0;
-                    commit_state(&mut state, &data_man, &H256::random(), &mut height, &mut commit_time);
-                }
-            }
-        }
-        let mut merged_rewards = HashMap::new();
-        for reward in epoch_trace.rewards {
-            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
-        }
-        for reward in merged_rewards {
-            state.add_balance(&reward.0, &reward.1, CleanupMode::ForceCreate, U256::zero()).unwrap();
-        }
-        line.clear();
-        last_epoch_number += 1;
-    }
-    let now = Instant::now();
-    state.commit(H256::random(), None).unwrap();
-    commit_time += now.elapsed();
-
-    if check_balance(&state, &data_man, last_epoch_number, &addresses) {
-        return;
-    }
-
-    println!("NotExecutedDrop: {}\n\
-        NotExecutedToReconsiderPacking: {}\n\
-        ExecutionErrorBumpNonce: {}\n\
-        Finished: {}",
-        not_executed_drop_cnt,
-        not_executed_to_reconsider_packing_cnt,
-        execution_error_bump_nonce_cnt,
-        finished_cnt
-    );
-    println!("transact_time: {} ms\n\
-        commit_time: {} ms",
-        transact_time.as_millis(),
-        commit_time.as_millis());
+    (data_man, state, genesis_block, machine)
 }
 
-fn check_balance(
+fn check_state(
     state: &State,
-    data_man: &BlockDataManager,
+    data_man_ori: &BlockDataManager,
     epoch_height: u64,
     addresses: &Vec<Address>
 ) -> bool
 {
-    let epoch_hashes = data_man.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
     let epoch_id = epoch_hashes.last().unwrap();
     let ori_state = State::new(StateDb::new(
-        data_man
+        data_man_ori
         .storage_manager
         .get_state_no_commit(
-            data_man.get_state_readonly_index(epoch_id).unwrap(),
+            data_man_ori.get_state_readonly_index(epoch_id).unwrap(),
             false
         ).unwrap().unwrap()
     )).unwrap();
@@ -265,6 +277,15 @@ fn check_balance(
         } else {
             // println!("{} good", address);
         }
+        // let ori_storage_root = ori_state.db.get_original_storage_root(address).unwrap();
+        // let cur_storage_root = state.db.get_original_storage_root(address).unwrap();
+        // if ori_storage_root != cur_storage_root {
+        //     println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
+        //         epoch_height, address, ori_storage_root, cur_storage_root);
+        //     wrong = true;
+        // } else {
+        //     // println!("storage_root of address {:x} is good", address);
+        // }
     }
     return wrong;
 }
@@ -330,7 +351,7 @@ fn genesis_state(
     initialize_internal_contract_accounts(
         &mut state,
         machine.internal_contracts().initialized_at_genesis(),
-        machine.spec(/* block_number = */ 0).contract_start_nonce,
+        machine.spec(0).contract_start_nonce,
     );
 
     let genesis_account_address =
@@ -573,6 +594,7 @@ fn genesis_state(
     //     "genesis debug_record {}",
     //     serde_json::to_string(&debug_record).unwrap()
     // );
+    println!("Hash of genesis: {:x}", genesis.hash());
     (genesis, state)
 }
 
