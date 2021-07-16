@@ -123,6 +123,7 @@ fn main() {
 
     let (data_man_ori, _, _, _) = open_db(&conf);
     conf.raw_conf.conflux_data_dir = "./replay_data".into();
+    let _ = std::fs::remove_dir_all(&conf.raw_conf.conflux_data_dir);
     let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
 
     let mut transaction_executed: usize = 0;
