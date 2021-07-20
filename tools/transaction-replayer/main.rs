@@ -56,7 +56,10 @@ use cfx_state::{
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::{StateDb/*, StateDbGetOriginalMethods*/};
+use cfx_statedb::{
+    StateDb,
+    StateDbGetOriginalMethods,
+};
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
@@ -84,10 +87,13 @@ struct BlockTrace {
     transactions: Vec<SignedTransaction>,
     env: Env,
 }
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct EpochTrace {
+    epoch_hash: H256,
     block_traces: Vec<BlockTrace>,
     rewards: Vec<(Address, U256)>,
+    newly_issued: U256,
 }
 
 fn main() {
@@ -130,7 +136,10 @@ fn main() {
     let mut transact_time = Duration::from_secs(0);
     let mut commit_time = Duration::from_secs(0);
     let mut height = 0;
-    next_state(&mut state, &data_man_replay, &genesis_block.hash(), &mut height);
+    let mut epoch_hash = genesis_block.hash();
+    next_state(&mut state, &data_man_replay, &epoch_hash, height);
+    let mut last_committed_height = height;
+    height += 1;
 
     let mut not_executed_drop_cnt = 0;
     let mut not_executed_to_reconsider_packing_cnt = 0;
@@ -138,20 +147,26 @@ fn main() {
     let mut finished_cnt = 0;
 
     let mut line = String::new();
-    let mut last_epoch_number = 0;
     while let Ok(_) = trace_reader.read_line(&mut line) {
         if line.len() == 0 {
             break;
         }
         let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
         for block_trace in epoch_trace.block_traces {
+            let spec = machine.spec(block_trace.env.number);
+            state.bump_block_number_accumulate_interest();
+            initialize_internal_contract_accounts(
+                &mut state,
+                machine.internal_contracts().initialized_at(block_trace.env.number),
+                spec.contract_start_nonce,
+            );
             for transaction in block_trace.transactions {
                 let now = Instant::now();
                 let exe_res = Executive::new(
                     &mut state,
                     &block_trace.env,
                     machine.as_ref(),
-                    &machine.spec(block_trace.env.number),
+                    &spec,
                 ).transact(&transaction, TransactOptions::with_no_tracing());
                 transact_time += now.elapsed();
                 let exe_res = exe_res.unwrap();
@@ -173,7 +188,6 @@ fn main() {
                 transaction_executed += 1;
                 if transaction_executed == commit_interval {
                     transaction_executed = 0;
-                    commit_state(&mut state, &data_man_replay, &H256::random(), &mut height, &mut commit_time);
                 }
             }
         }
@@ -181,17 +195,28 @@ fn main() {
         for reward in epoch_trace.rewards {
             *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
         }
-        for reward in merged_rewards {
-            state.add_balance(&reward.0, &reward.1, CleanupMode::ForceCreate, U256::zero()).unwrap();
+        for (address, reward) in merged_rewards {
+            state.add_balance(
+                &address, &reward, CleanupMode::ForceCreate, U256::zero()
+            ).unwrap();
         }
         line.clear();
-        last_epoch_number += 1;
+        state.add_total_issued(epoch_trace.newly_issued);
+        epoch_hash = H256::random();
+        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
+        next_state(&mut state, &data_man_replay, &epoch_hash, height);
+        last_committed_height = height;
+        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
+        //     return;
+        // }
+        height += 1;
     }
-    let now = Instant::now();
-    state.commit(H256::random(), None).unwrap();
-    commit_time += now.elapsed();
-
-    if check_state(&state, &data_man_ori, last_epoch_number, &addresses) {
+    height -= 1;
+    if last_committed_height < height {
+        epoch_hash = H256::random();
+        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
+    }
+    if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
         return;
     }
 
@@ -250,27 +275,40 @@ fn open_db(conf: &Configuration)
     (data_man, state, genesis_block, machine)
 }
 
+fn get_state_no_commit_by_epoch_hash(
+    data_man: &BlockDataManager,
+    epoch_hash: &H256
+) -> State
+{
+    State::new(StateDb::new(
+        data_man
+        .storage_manager
+        .get_state_no_commit(
+            data_man.get_state_readonly_index(epoch_hash).unwrap(),
+            false
+        ).unwrap().unwrap()
+    )).unwrap()
+}
+
 fn check_state(
-    state: &State,
+    data_man_replay: &BlockDataManager,
+    epoch_hash_replay: &H256,
     data_man_ori: &BlockDataManager,
     epoch_height: u64,
     addresses: &Vec<Address>
 ) -> bool
 {
+    let state_replay = get_state_no_commit_by_epoch_hash(
+        data_man_replay, epoch_hash_replay);
     let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
     let epoch_id = epoch_hashes.last().unwrap();
-    let ori_state = State::new(StateDb::new(
-        data_man_ori
-        .storage_manager
-        .get_state_no_commit(
-            data_man_ori.get_state_readonly_index(epoch_id).unwrap(),
-            false
-        ).unwrap().unwrap()
-    )).unwrap();
+    let state_ori = get_state_no_commit_by_epoch_hash(
+        data_man_ori, &epoch_id);
+
     let mut wrong = false;
     for address in addresses {
-        let ori_balance = ori_state.balance(address).unwrap();
-        let cur_balance = state.balance(address).unwrap();
+        let ori_balance = state_ori.balance(address).unwrap();
+        let cur_balance = state_replay.balance(address).unwrap();
         if ori_balance != cur_balance {
             println!("Error: epoch_height {}, address {:x}: ori_balance = {}, cur_balance = {}",
                 epoch_height, address, ori_balance, cur_balance);
@@ -278,15 +316,17 @@ fn check_state(
         } else {
             // println!("{} good", address);
         }
-        // let ori_storage_root = ori_state.db.get_original_storage_root(address).unwrap();
-        // let cur_storage_root = state.db.get_original_storage_root(address).unwrap();
-        // if ori_storage_root != cur_storage_root {
-        //     println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
-        //         epoch_height, address, ori_storage_root, cur_storage_root);
-        //     wrong = true;
-        // } else {
-        //     // println!("storage_root of address {:x} is good", address);
-        // }
+
+        // state must have been committed
+        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
+        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
+        if ori_storage_root != cur_storage_root {
+            println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
+                epoch_height, address, ori_storage_root, cur_storage_root);
+            wrong = true;
+        } else {
+            // println!("storage_root of address {:x} is good", address);
+        }
     }
     return wrong;
 }
@@ -295,7 +335,6 @@ fn commit_state(
     state: &mut State,
     data_man: &BlockDataManager,
     epoch_hash: &H256,
-    height: &mut u64,
     commit_time: &mut Duration,
 )
 {
@@ -307,7 +346,6 @@ fn commit_state(
         H256::zero(),
         H256::zero(),
     );
-    next_state(state, data_man, epoch_hash, height);
     *commit_time += now.elapsed();
 }
 
@@ -315,7 +353,7 @@ fn next_state(
     state: &mut State,
     data_man: &BlockDataManager,
     epoch_hash: &H256,
-    height: &mut u64)
+    height: u64)
 {
     *state = State::new(StateDb::new(
         data_man
@@ -327,12 +365,11 @@ fn next_state(
                 .get_epoch_execution_commitment(epoch_hash)
                 .unwrap()
                 .state_root_with_aux_info,
-                *height,
+                height,
                 data_man.get_snapshot_epoch_count()
             )
         ).unwrap().unwrap()
     )).unwrap();
-    *height += 1;
 }
 
 fn genesis_state(

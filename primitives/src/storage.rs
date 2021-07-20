@@ -95,7 +95,7 @@ impl Decodable for MptValue<H256> {
     }
 }
 
-#[derive(Clone, Debug, RlpEncodable, RlpDecodable, Serialize)]
+#[derive(Clone, Debug, RlpEncodable, RlpDecodable, Serialize, PartialEq)]
 pub struct NodeMerkleTriplet {
     pub delta: MptValue<H256>,
     pub intermediate: MptValue<H256>,

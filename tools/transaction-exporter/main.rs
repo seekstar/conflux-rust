@@ -14,7 +14,7 @@ use cfxcore::{
     pow::PowComputer,
     vm::{Env},
 };
-use cfx_types::{U256, Address};
+use cfx_types::{H256, U256, Address};
 use client::configuration::Configuration;
 
 extern crate serde_json;
@@ -26,8 +26,10 @@ struct BlockTrace {
 }
 #[derive(Serialize)]
 struct EpochTrace {
+    epoch_hash: H256,
     block_traces: Vec<BlockTrace>,
     rewards: Vec<(Address, U256)>,
+    newly_issued: U256,
 }
 
 fn main() {
@@ -100,7 +102,7 @@ fn main() {
                 Some(reward) => { reward }
             };
             let author = block.block_header.author();
-            rewards.push((author.clone(), reward.total_reward));
+            rewards.push((author.clone(), reward));
             addresses.insert(author.clone());
             let res = data_man.block_execution_result_by_hash_from_db(&hash).unwrap();
             for receipt in &res.1.block_receipts.as_ref().receipts {
@@ -108,19 +110,28 @@ fn main() {
             }
             last_block_hash = hash;
         }
+        let epoch_rewards = if rewards_queue.len() == 12 {
+                rewards_queue.pop_front().unwrap()
+            } else {
+                Vec::new()
+            };
+        rewards_queue.push_back(rewards);
+        let mut rewards = Vec::new();
+        let mut newly_issued = U256::from(0);
+        for (author, reward) in epoch_rewards {
+            rewards.push((author, reward.total_reward));
+            newly_issued += reward.total_reward - reward.tx_fee;
+        }
         let epoch_trace = EpochTrace {
+            epoch_hash: pivot_hash,
             block_traces: block_trace,
-            rewards: if rewards_queue.len() == 12 {
-                    rewards_queue.pop_front().unwrap()
-                } else {
-                    Vec::new()
-                }
+            rewards,
+            newly_issued,
         };
         writeln!(trace_writer, "{}",
             serde_json::to_string(&epoch_trace)
                 .expect("Can not stringify the transaction!"))
         .unwrap();
-        rewards_queue.push_back(rewards);
         epoch += 1;
     }
     for address in addresses.iter() {

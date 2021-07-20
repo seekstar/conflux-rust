@@ -76,7 +76,7 @@ struct StakingState {
 pub type State = StateGeneric<StorageState>;
 
 pub struct StateGeneric<StateDbStorage: StorageStateTrait> {
-    db: StateDb<StateDbStorage>,
+    pub db: StateDb<StateDbStorage>,
 
     // Only created once for txpool notification.
     // Each element is an Ok(Account) for updated account, or Err(Address)
