@@ -9,7 +9,32 @@
 ///
 /// A writable state is copy-on-write reference to the base state in the
 /// state manager. State is supposed to be owned by single user.
+
+use std::fs::File;
+use std::io::BufWriter;
+use std::sync::Mutex;
+
+use serde::{Serialize};
+
+use cfx_types::{Address, H256, U256};
+
 pub use super::impls::state::State;
+
+lazy_static! {
+    pub static ref STATE_KV_TRACE_WRITER: Mutex<BufWriter<File>> =
+        Mutex::new(BufWriter::new(File::create("state_kv_trace.txt").unwrap()));
+}
+
+#[derive(Serialize)]
+pub enum StateKVTraceItem<'a, 'b> {
+    Epoch(H256),
+    Transaction(H256),
+    Reward(Address, U256),
+    Get(StorageKey<'a>),
+    Set(StorageKey<'a>, &'b Box<[u8]>),
+    Delete(StorageKey<'a>),
+    DeletaAll(StorageKey<'a>),
+}
 
 pub type WithProof = primitives::static_bool::Yes;
 pub type NoProof = primitives::static_bool::No;

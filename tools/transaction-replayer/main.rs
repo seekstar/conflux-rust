@@ -3,11 +3,11 @@ use std::{
     io::{
         BufReader,
         BufRead,
+        Write,
     },
     sync::{Arc},
     str::FromStr,
-    time::{Instant, Duration},
-    collections::HashMap,
+    collections::BTreeMap,
 };
 
 use threadpool::ThreadPool;
@@ -56,14 +56,15 @@ use cfx_state::{
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::{
-    StateDb,
-    StateDbGetOriginalMethods,
-};
+use cfx_statedb::StateDb;
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
     StateIndex,
+    state::{
+        StateKVTraceItem,
+        STATE_KV_TRACE_WRITER,
+    }
 };
 use cfx_parameters::{
     consensus::{
@@ -106,35 +107,18 @@ fn main() {
                 .help("The directory which stores trace.txt and mined.txt")
                 .takes_value(true)
                 .default_value("."),
-        ).arg(
-            Arg::with_name("commit-interval")
-                .short("i")
-                .long("commit-interval")
-                .value_name("commit-interval")
-                .help("Commit every <commit-interval> transactions")
-                .takes_value(true)
-                .default_value("100"),
         ).get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
-    let commit_interval: usize =
-        arg_matches.value_of("commit-interval").unwrap().parse().unwrap();
     let trace_path = format!("{}/trace.txt", dir);
-    let address_path = format!("{}/address.txt", dir);
     let trace_file = File::open(trace_path).unwrap();
     let mut trace_reader = BufReader::new(trace_file);
 
-    let addresses = read_addresses(&address_path);
-
-    let (data_man_ori, _, _, _) = open_db(&conf);
     conf.raw_conf.conflux_data_dir = "./replay_data".into();
     let _ = std::fs::remove_dir_all(&conf.raw_conf.conflux_data_dir);
     let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
 
-    let mut transaction_executed: usize = 0;
-    let mut transact_time = Duration::from_secs(0);
-    let mut commit_time = Duration::from_secs(0);
     let mut height = 0;
     let mut epoch_hash = genesis_block.hash();
     next_state(&mut state, &data_man_replay, &epoch_hash, height);
@@ -152,6 +136,11 @@ fn main() {
             break;
         }
         let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
+        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
+            serde_json::to_string(
+                &StateKVTraceItem::Epoch(epoch_trace.epoch_hash.clone())
+            ).unwrap()
+        ).unwrap();
         for block_trace in epoch_trace.block_traces {
             let spec = machine.spec(block_trace.env.number);
             state.bump_block_number_accumulate_interest();
@@ -160,15 +149,19 @@ fn main() {
                 machine.internal_contracts().initialized_at(block_trace.env.number),
                 spec.contract_start_nonce,
             );
-            for transaction in block_trace.transactions {
-                let now = Instant::now();
+            for mut transaction in block_trace.transactions {
+                transaction.transaction.compute_hash();
+                writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
+                    serde_json::to_string(
+                        &StateKVTraceItem::Transaction(transaction.hash())
+                    ).unwrap()
+                ).unwrap();
                 let exe_res = Executive::new(
                     &mut state,
                     &block_trace.env,
                     machine.as_ref(),
                     &spec,
                 ).transact(&transaction, TransactOptions::with_no_tracing());
-                transact_time += now.elapsed();
                 let exe_res = exe_res.unwrap();
                 match exe_res
                 {
@@ -185,17 +178,18 @@ fn main() {
                         finished_cnt += 1;
                     }
                 }
-                transaction_executed += 1;
-                if transaction_executed == commit_interval {
-                    transaction_executed = 0;
-                }
             }
         }
-        let mut merged_rewards = HashMap::new();
+        let mut merged_rewards = BTreeMap::new();
         for reward in epoch_trace.rewards {
             *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
         }
         for (address, reward) in merged_rewards {
+            writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
+                serde_json::to_string(
+                    &StateKVTraceItem::Reward(address, reward)
+                ).unwrap()
+            ).unwrap();
             state.add_balance(
                 &address, &reward, CleanupMode::ForceCreate, U256::zero()
             ).unwrap();
@@ -203,21 +197,15 @@ fn main() {
         line.clear();
         state.add_total_issued(epoch_trace.newly_issued);
         epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
+        commit_state(&mut state, &data_man_replay, &epoch_hash);
         next_state(&mut state, &data_man_replay, &epoch_hash, height);
         last_committed_height = height;
-        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        //     return;
-        // }
         height += 1;
     }
     height -= 1;
     if last_committed_height < height {
         epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
-    }
-    if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        return;
+        commit_state(&mut state, &data_man_replay, &epoch_hash);
     }
 
     println!("NotExecutedDrop: {}\n\
@@ -229,10 +217,6 @@ fn main() {
         execution_error_bump_nonce_cnt,
         finished_cnt
     );
-    println!("transact_time: {} ms\n\
-        commit_time: {} ms",
-        transact_time.as_millis(),
-        commit_time.as_millis());
 }
 
 fn open_db(conf: &Configuration)
@@ -275,70 +259,12 @@ fn open_db(conf: &Configuration)
     (data_man, state, genesis_block, machine)
 }
 
-fn get_state_no_commit_by_epoch_hash(
-    data_man: &BlockDataManager,
-    epoch_hash: &H256
-) -> State
-{
-    State::new(StateDb::new(
-        data_man
-        .storage_manager
-        .get_state_no_commit(
-            data_man.get_state_readonly_index(epoch_hash).unwrap(),
-            false
-        ).unwrap().unwrap()
-    )).unwrap()
-}
-
-fn check_state(
-    data_man_replay: &BlockDataManager,
-    epoch_hash_replay: &H256,
-    data_man_ori: &BlockDataManager,
-    epoch_height: u64,
-    addresses: &Vec<Address>
-) -> bool
-{
-    let state_replay = get_state_no_commit_by_epoch_hash(
-        data_man_replay, epoch_hash_replay);
-    let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
-    let epoch_id = epoch_hashes.last().unwrap();
-    let state_ori = get_state_no_commit_by_epoch_hash(
-        data_man_ori, &epoch_id);
-
-    let mut wrong = false;
-    for address in addresses {
-        let ori_balance = state_ori.balance(address).unwrap();
-        let cur_balance = state_replay.balance(address).unwrap();
-        if ori_balance != cur_balance {
-            println!("Error: epoch_height {}, address {:x}: ori_balance = {}, cur_balance = {}",
-                epoch_height, address, ori_balance, cur_balance);
-            wrong = true;
-        } else {
-            // println!("{} good", address);
-        }
-
-        // state must have been committed
-        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
-        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
-        if ori_storage_root != cur_storage_root {
-            println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
-                epoch_height, address, ori_storage_root, cur_storage_root);
-            wrong = true;
-        } else {
-            // println!("storage_root of address {:x} is good", address);
-        }
-    }
-    return wrong;
-}
-
 fn commit_state(
     state: &mut State,
     data_man: &BlockDataManager,
     epoch_hash: &H256,
-    commit_time: &mut Duration,
 )
 {
-    let now = Instant::now();
     let state_root = state.commit(epoch_hash.clone(), None).unwrap();
     data_man.insert_epoch_execution_commitment(
         epoch_hash.clone(),
@@ -346,7 +272,6 @@ fn commit_state(
         H256::zero(),
         H256::zero(),
     );
-    *commit_time += now.elapsed();
 }
 
 fn next_state(
@@ -634,20 +559,4 @@ fn genesis_state(
     // );
     println!("Hash of genesis: {:x}", genesis.hash());
     (genesis, state)
-}
-
-fn read_addresses(address_path: &str) -> Vec<Address> {
-    let address_file = File::open(address_path).unwrap();
-    let mut address_reader = BufReader::new(address_file);
-    let mut ret = Vec::new();
-    let mut line = String::new();
-    while let Ok(_) = address_reader.read_line(&mut line) {
-        if line.len() == 0 {
-            break;
-        }
-        let address: Address = line.parse().unwrap();
-        line.clear();
-        ret.push(address);
-    }
-    ret
 }

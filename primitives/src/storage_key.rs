@@ -3,6 +3,7 @@
 // See http://www.gnu.org/licenses/
 
 use crate::static_bool::{self, StaticBool};
+use serde::{Serialize, Deserialize};
 
 pub type CheckInput = static_bool::Yes;
 pub type SkipInputCheck = static_bool::No;
@@ -38,7 +39,7 @@ impl<'a> ConditionalReturnValue<'a> for FromKeyBytesResult<CheckInput> {
 
 // The original StorageKeys unprocessed, in contrary to StorageKey which is
 // processed to use in DeltaMpt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StorageKey<'a> {
     AccountKey(&'a [u8]),
     StorageRootKey(&'a [u8]),
@@ -603,7 +604,6 @@ use super::{MerkleHash, MERKLE_NULL_NODE};
 use cfx_types::{Address, H256};
 use hash::keccak;
 use rlp::{Decodable, DecoderError, Encodable, Rlp, RlpStream};
-use serde::{Deserialize, Serialize};
 use std::{
     convert::AsRef,
     hint::unreachable_unchecked,

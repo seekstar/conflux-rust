@@ -545,6 +545,7 @@ dependencies = [
  "rustc-hex",
  "serde",
  "serde_derive",
+ "serde_json",
  "sqlite",
  "sqlite3-sys",
  "strfmt",

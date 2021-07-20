@@ -288,18 +288,19 @@ impl Transaction {
     /// Specify the sender; this won't survive the serialize/deserialize
     /// process, but can be cloned.
     pub fn fake_sign(self, from: Address) -> SignedTransaction {
+        let mut transaction = TransactionWithSignature {
+            transaction: TransactionWithSignatureSerializePart {
+                unsigned: self,
+                r: U256::one(),
+                s: U256::one(),
+                v: 0,
+            },
+            hash: H256::zero(),
+            rlp_size: None,
+        };
+        transaction.compute_hash();
         SignedTransaction {
-            transaction: TransactionWithSignature {
-                transaction: TransactionWithSignatureSerializePart {
-                    unsigned: self,
-                    r: U256::one(),
-                    s: U256::one(),
-                    v: 0,
-                },
-                hash: H256::zero(),
-                rlp_size: None,
-            }
-            .compute_hash(),
+            transaction,
             sender: from,
             public: None,
         }
@@ -307,7 +308,7 @@ impl Transaction {
 
     /// Signs the transaction with signature.
     pub fn with_signature(self, sig: Signature) -> TransactionWithSignature {
-        TransactionWithSignature {
+        let mut transaction = TransactionWithSignature {
             transaction: TransactionWithSignatureSerializePart {
                 unsigned: self,
                 r: sig.r().into(),
@@ -316,8 +317,9 @@ impl Transaction {
             },
             hash: H256::zero(),
             rlp_size: None,
-        }
-        .compute_hash()
+        };
+        transaction.compute_hash();
+        transaction
     }
 }
 
@@ -413,10 +415,8 @@ impl TransactionWithSignature {
     }
 
     /// Used to compute hash of created transactions
-    fn compute_hash(mut self) -> TransactionWithSignature {
-        let hash = keccak(&*self.rlp_bytes());
-        self.hash = hash;
-        self
+    pub fn compute_hash(&mut self) {
+        self.hash = keccak(self.rlp_bytes());
     }
 
     /// Checks whether signature is empty.

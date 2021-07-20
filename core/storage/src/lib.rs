@@ -15,6 +15,8 @@ extern crate error_chain;
 extern crate lazy_static;
 #[macro_use]
 extern crate log;
+extern crate serde;
+extern crate serde_json;
 
 #[macro_use]
 pub mod utils;

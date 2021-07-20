@@ -69,6 +69,7 @@ fn main() {
         let mut last_block_hash = pivot_block.block_header.parent_hash().clone();
         let mut block_trace = Vec::new();
         let mut rewards = Vec::new();
+        let mut block_number = ctx.start_block_number;
         for hash in hashes {
             let block = data_man.block_by_hash(&hash, false).unwrap();
             for transaction in &block.transactions {
@@ -83,7 +84,7 @@ fn main() {
             block_trace.push(BlockTrace {
                 transactions: block.transactions.clone(),
                 env: Env {
-                    number: ctx.start_block_number,
+                    number: block_number,
                     author: block.block_header.author().clone(),
                     timestamp: block.block_header.timestamp(),
                     difficulty: block.block_header.difficulty().clone(),
@@ -109,6 +110,7 @@ fn main() {
                 cnts[receipt.outcome_status as usize] += 1;
             }
             last_block_hash = hash;
+            block_number += 1;
         }
         let epoch_rewards = if rewards_queue.len() == 12 {
                 rewards_queue.pop_front().unwrap()
