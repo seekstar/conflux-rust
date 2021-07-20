@@ -93,7 +93,8 @@ struct EpochTrace {
     epoch_hash: H256,
     block_traces: Vec<BlockTrace>,
     rewards: Vec<(Address, U256)>,
-    newly_issued: U256,
+    new_mint: U256,
+    burnt_fee: U256,
 }
 
 fn main() {
@@ -200,8 +201,13 @@ fn main() {
                 &address, &reward, CleanupMode::ForceCreate, U256::zero()
             ).unwrap();
         }
-        line.clear();
-        state.add_total_issued(epoch_trace.newly_issued);
+        if epoch_trace.new_mint > epoch_trace.burnt_fee {
+            state.add_total_issued(epoch_trace.new_mint - epoch_trace.burnt_fee);
+        } else {
+            state.subtract_total_issued(
+                epoch_trace.burnt_fee - epoch_trace.new_mint
+            );
+        }
         epoch_hash = H256::random();
         commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
         next_state(&mut state, &data_man_replay, &epoch_hash, height);
@@ -209,6 +215,7 @@ fn main() {
         // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
         //     return;
         // }
+        line.clear();
         height += 1;
     }
     height -= 1;

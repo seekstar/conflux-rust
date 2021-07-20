@@ -1,9 +1,9 @@
 use crate::{
     block_data_manager::{
         db_decode_list, db_encode_list, BlamedHeaderVerifiedRoots,
-        BlockExecutionResultWithEpoch, BlockRewardResult, BlockTracesWithEpoch,
-        CheckpointHashes, DataVersionTuple, EpochExecutionContext,
-        LocalBlockInfo,
+        BlockExecutionResultWithEpoch, BlockRewardResult, EpochRewardResult,
+        BlockTracesWithEpoch, CheckpointHashes, DataVersionTuple,
+        EpochExecutionContext, LocalBlockInfo,
     },
     db::{
         COL_BLAMED_HEADER_VERIFIED_ROOTS, COL_BLOCKS, COL_BLOCK_TRACES,
@@ -36,6 +36,7 @@ const EPOCH_CONSENSUS_EXECUTION_INFO_SUFFIX_BYTE: u8 = 5;
 const EPOCH_EXECUTED_BLOCK_SET_SUFFIX_BYTE: u8 = 6;
 const EPOCH_SKIPPED_BLOCK_SET_SUFFIX_BYTE: u8 = 7;
 const BLOCK_REWARD_RESULT_SUFFIX_BYTE: u8 = 8;
+const EPOCH_REWARD_RESULT_SUFFIX_BYTE: u8 = 233;
 const BLOCK_TERMINAL_KEY: &[u8] = b"block_terminals";
 const GC_PROGRESS_KEY: &[u8] = b"gc_progress";
 
@@ -314,6 +315,16 @@ impl DBManager {
         )
     }
 
+    pub fn insert_epoch_reward_result_to_db(
+        &self, epoch_later_hash: &H256, value: &EpochRewardResult,
+    ) {
+        self.insert_encodable_val(
+            DBTable::Blocks,
+            &epoch_reward_result_key(epoch_later_hash),
+            value,
+        )
+    }
+
     pub fn block_execution_result_from_db(
         &self, hash: &H256,
     ) -> Option<BlockExecutionResultWithEpoch> {
@@ -329,6 +340,15 @@ impl DBManager {
         self.load_might_decodable_val(
             DBTable::Blocks,
             &block_reward_result_key(hash),
+        )
+    }
+
+    pub fn epoch_reward_result_from_db(
+        &self, epoch_later_hash: &H256,
+    ) -> Option<EpochRewardResult> {
+        self.load_decodable_val(
+            DBTable::Blocks,
+            &epoch_reward_result_key(epoch_later_hash),
         )
     }
 
@@ -587,6 +607,10 @@ fn block_execution_result_key(hash: &H256) -> Vec<u8> {
 
 fn block_reward_result_key(hash: &H256) -> Vec<u8> {
     append_suffix(hash, BLOCK_REWARD_RESULT_SUFFIX_BYTE)
+}
+
+fn epoch_reward_result_key(hash: &H256) -> Vec<u8> {
+    append_suffix(hash, EPOCH_REWARD_RESULT_SUFFIX_BYTE)
 }
 
 fn epoch_execution_context_key(hash: &H256) -> Vec<u8> {

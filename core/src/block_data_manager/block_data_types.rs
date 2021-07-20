@@ -67,6 +67,12 @@ impl Default for BlockRewardResult {
     }
 }
 
+#[derive(RlpEncodable, RlpDecodable, Clone, Copy, Debug)]
+pub struct EpochRewardResult {
+    pub burnt_fee: U256,
+}
+impl_db_encoding_as_rlp!(EpochRewardResult);
+
 pub type BlockRewardsInfo = BlockDataWithMultiVersion<H256, BlockRewardResult>;
 
 #[derive(Clone, Debug, DeriveMallocSizeOf)]

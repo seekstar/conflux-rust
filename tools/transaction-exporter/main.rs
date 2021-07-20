@@ -29,7 +29,8 @@ struct EpochTrace {
     epoch_hash: H256,
     block_traces: Vec<BlockTrace>,
     rewards: Vec<(Address, U256)>,
-    newly_issued: U256,
+    new_mint: U256,
+    burnt_fee: U256,
 }
 
 fn main() {
@@ -119,16 +120,20 @@ fn main() {
             };
         rewards_queue.push_back(rewards);
         let mut rewards = Vec::new();
-        let mut newly_issued = U256::from(0);
+        let mut new_mint = U256::from(0);
         for (author, reward) in epoch_rewards {
             rewards.push((author, reward.total_reward));
-            newly_issued += reward.total_reward - reward.tx_fee;
+            new_mint += reward.total_reward - reward.tx_fee;
         }
+        let burnt_fee = data_man.db_manager.epoch_reward_result_from_db(
+            &epoch_later,
+        ).unwrap().burnt_fee;
         let epoch_trace = EpochTrace {
             epoch_hash: pivot_hash,
             block_traces: block_trace,
             rewards,
-            newly_issued,
+            new_mint,
+            burnt_fee,
         };
         writeln!(trace_writer, "{}",
             serde_json::to_string(&epoch_trace)
