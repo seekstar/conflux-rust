@@ -86,7 +86,7 @@ fn main() {
                 env: Env {
                     number: block_number,
                     author: block.block_header.author().clone(),
-                    timestamp: block.block_header.timestamp(),
+                    timestamp: pivot_block.block_header.timestamp(),
                     difficulty: block.block_header.difficulty().clone(),
                     gas_limit: block.block_header.gas_limit().clone(),
                     last_hash: last_block_hash,
