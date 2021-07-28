@@ -2,9 +2,9 @@
 // Conflux is free software and distributed under GNU General Public License.
 // See http://www.gnu.org/licenses/
 
-use std::io::Write;
+use super::super::state::{STATE_KV_TRACE_WRITER, serialize_into_file_wrapped};
 
-use super::super::state::STATE_KV_TRACE_WRITER;
+extern crate bincode;
 
 pub type ChildrenMerkleMap =
     BTreeMap<ActualSlabIndex, VanillaChildrenTable<MerkleHash>>;
@@ -232,8 +232,10 @@ impl Drop for State {
 
 impl StateTrait for State {
     fn get(&self, access_key: StorageKey) -> Result<Option<Box<[u8]>>> {
-        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
-            serde_json::to_string(&StateKVTraceItem::Get(access_key)).unwrap()).unwrap();
+        serialize_into_file_wrapped(
+            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
+            &StateKVTraceItem::Get(access_key),
+        ).unwrap();
         self.ensure_temp_slab_for_db_load();
 
         self.get_from_all_tries::<NoProof>(access_key)
@@ -241,9 +243,9 @@ impl StateTrait for State {
     }
 
     fn set(&mut self, access_key: StorageKey, value: Box<[u8]>) -> Result<()> {
-        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
-            serde_json::to_string(&StateKVTraceItem::Set(access_key, &value))
-                .unwrap()
+        serialize_into_file_wrapped(
+            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
+            &StateKVTraceItem::Set(access_key, &value),
         ).unwrap();
         self.pre_modification();
 
@@ -263,9 +265,9 @@ impl StateTrait for State {
     }
 
     fn delete(&mut self, access_key: StorageKey) -> Result<()> {
-        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
-            serde_json::to_string(&StateKVTraceItem::Delete(access_key))
-                .unwrap()
+        serialize_into_file_wrapped(
+            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
+            &StateKVTraceItem::Delete(access_key),
         ).unwrap();
         self.set(access_key, MptValue::<Box<[u8]>>::TombStone.unwrap())?;
         Ok(())
@@ -308,10 +310,12 @@ impl StateTrait for State {
     fn delete_all<AM: access_mode::AccessMode>(
         &mut self, access_key_prefix: StorageKey,
     ) -> Result<Option<Vec<MptKeyValue>>> {
-        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
-            serde_json::to_string(
-                &StateKVTraceItem::DeletaAll(access_key_prefix)
-            ).unwrap()
+        serialize_into_file_wrapped(
+            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
+            &StateKVTraceItem::DeletaAll(
+                access_key_prefix,
+                AM::is_read_only(),
+            ),
         ).unwrap();
         if AM::is_read_only() {
             self.ensure_temp_slab_for_db_load();

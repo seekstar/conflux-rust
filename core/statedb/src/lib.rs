@@ -48,7 +48,7 @@ mod impls {
 
         /// The underlying storage, The storage is updated only upon fn
         /// commit().
-        storage: Storage,
+        pub storage: Storage,
 
         /// Checkpoints allow callers to revert un-committed changes.
         checkpoints: Vec<Checkpoint>,

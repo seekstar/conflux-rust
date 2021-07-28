@@ -11,7 +11,7 @@
 /// state manager. State is supposed to be owned by single user.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{Write, BufWriter};
 use std::sync::Mutex;
 
 use serde::{Serialize};
@@ -22,7 +22,12 @@ pub use super::impls::state::State;
 
 lazy_static! {
     pub static ref STATE_KV_TRACE_WRITER: Mutex<BufWriter<File>> =
-        Mutex::new(BufWriter::new(File::create("state_kv_trace.txt").unwrap()));
+        Mutex::new(BufWriter::new(File::create("state_kv_trace_tmp").unwrap()));
+}
+
+#[derive(Debug, Serialize)]
+struct Wrapper {
+    data: Box<[u8]>,
 }
 
 #[derive(Serialize)]
@@ -33,7 +38,19 @@ pub enum StateKVTraceItem<'a, 'b> {
     Get(StorageKey<'a>),
     Set(StorageKey<'a>, &'b Box<[u8]>),
     Delete(StorageKey<'a>),
-    DeletaAll(StorageKey<'a>),
+    DeletaAll(StorageKey<'a>, bool), // bool: is_read_only
+}
+
+pub fn serialize_into_file_wrapped<W, T: ?Sized>(
+    writer: W, value: &T
+) -> std::result::Result<(), Box<bincode::ErrorKind>>
+where
+    W: Write,
+    T: Serialize,
+{
+    // println!("{}", serde_json::to_string(value).unwrap());
+    let data = Box::from(bincode::serialize(value)?);
+    bincode::serialize_into(writer, &Wrapper{data})
 }
 
 pub type WithProof = primitives::static_bool::Yes;

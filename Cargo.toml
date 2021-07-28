@@ -56,6 +56,7 @@ cfx-statedb = { path = "core/statedb" }
 cfx-storage = { path = "core/storage" }
 cfx-parameters = { path = "core/parameters" }
 cfx-state = { path = "core/state" }
+bincode = "1.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies.jemallocator]
 version = "0.3.2"
@@ -84,6 +85,10 @@ path = "tools/transaction-exporter/main.rs"
 [[bin]]
 name = "transaction-replayer"
 path = "tools/transaction-replayer/main.rs"
+
+[[bin]]
+name = "kv-replayer"
+path = "tools/kv-replayer/main.rs"
 
 # Use workspace section to allow test all cases under root folder (cargo test --all).
 [workspace]

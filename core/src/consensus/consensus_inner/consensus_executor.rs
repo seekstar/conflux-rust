@@ -41,7 +41,11 @@ use cfx_statedb::{Result as DbResult, StateDb};
 use cfx_storage::{
     defaults::DEFAULT_EXECUTION_PREFETCH_THREADS, StateIndex,
     StorageManagerTrait,
-    state::{STATE_KV_TRACE_WRITER, StateKVTraceItem},
+    state::{
+        STATE_KV_TRACE_WRITER,
+        StateKVTraceItem,
+        serialize_into_file_wrapped,
+    },
 };
 use cfx_types::{
     address_util::AddressUtil, BigEndianHash, H160, H256, KECCAK_EMPTY_BLOOM,
@@ -73,8 +77,9 @@ use std::{
         Arc,
     },
     thread::{self, JoinHandle},
-    io::Write,
 };
+
+extern crate bincode;
 
 lazy_static! {
     static ref CONSENSIS_EXECUTION_TIMER: Arc<dyn Meter> =
@@ -903,8 +908,9 @@ impl ConsensusExecutionHandler {
         force_recompute: bool,
     )
     {
-        writeln!(STATE_KV_TRACE_WRITER.lock().unwrap(), "{}",
-            serde_json::to_string(&StateKVTraceItem::Epoch(epoch_hash.clone())).unwrap()
+        serialize_into_file_wrapped(
+            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
+            &StateKVTraceItem::Epoch(epoch_hash.clone()),
         ).unwrap();
         // FIXME: Question: where to calculate if we should make a snapshot?
         // FIXME: Currently we make the snapshotting decision when committing

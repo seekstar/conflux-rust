@@ -6,7 +6,6 @@ use std::{
     },
     sync::{Arc},
     str::FromStr,
-    collections::BTreeMap,
 };
 
 use threadpool::ThreadPool;
@@ -17,12 +16,12 @@ use serde::Deserialize;
 
 use cfx_types::{H256, U256, Address, address_util::AddressUtil};
 use primitives::{
-    SignedTransaction,
     Transaction,
     Action,
     Block,
     BlockReceipts,
     BlockHeaderBuilder,
+    StorageKey,
 };
 use cfxcore::{
     state::State,
@@ -41,13 +40,8 @@ use cfxcore::{
     machine::{new_machine_with_builtin, Machine},
     pow::PowComputer,
     BlockDataManager,
-    executive::{
-        Executive,
-        contract_address,
-        TransactOptions,
-        ExecutionOutcome,
-    },
-    vm::{Env, CreateContractAddress},
+    executive::contract_address,
+    vm::{CreateContractAddress},
     verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
@@ -55,16 +49,13 @@ use cfx_state::{
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::StateDb;
+use cfx_statedb::{StateDb, StateDbGetOriginalMethods};
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
     StateIndex,
-    state::{
-        StateKVTraceItem,
-        STATE_KV_TRACE_WRITER,
-        serialize_into_file_wrapped,
-    }
+    StorageStateTrait,
+    utils::access_mode,
 };
 use cfx_parameters::{
     consensus::{
@@ -79,22 +70,24 @@ use cfx_parameters::{
 
 use client::configuration::Configuration;
 
+extern crate bincode;
+
 const GENESIS_VERSION: &str = "1949000000000000000000000000000000001001";
 
-extern crate serde_json;
-
 #[derive(Deserialize)]
-struct BlockTrace {
-    transactions: Vec<SignedTransaction>,
-    env: Env,
+struct Wrapper {
+    data: Box<[u8]>,
 }
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct EpochTrace {
-    epoch_hash: H256,
-    block_traces: Vec<BlockTrace>,
-    rewards: Vec<(Address, U256)>,
-    newly_issued: U256,
+
+#[derive(Debug, Deserialize)]
+pub enum StateKVTraceItem<'a> {
+    Epoch(H256),
+    Transaction(H256),
+    Reward(Address, U256),
+    Get(StorageKey<'a>),
+    Set(StorageKey<'a>, &'a [u8]),
+    Delete(StorageKey<'a>),
+    DeletaAll(StorageKey<'a>, bool), // bool: is_read_only
 }
 
 fn main() {
@@ -111,114 +104,68 @@ fn main() {
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
-    let trace_path = format!("{}/trace.txt", dir);
+    let trace_path = format!("{}/state_kv_trace", dir);
+    let address_path = format!("{}/address.txt", dir);
     let trace_file = File::open(trace_path).unwrap();
     let mut trace_reader = BufReader::new(trace_file);
+    let addresses = read_addresses(&address_path);
 
-    conf.raw_conf.conflux_data_dir = "./replay_data".into();
+    let (data_man_ori, _, _, _) = open_db(&conf);
+    conf.raw_conf.conflux_data_dir = "./kv_replay_data".into();
     let _ = std::fs::remove_dir_all(&conf.raw_conf.conflux_data_dir);
-    let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
+    let (data_man_replay, mut state, genesis_block, _machine) = open_db(&conf);
 
     let mut height = 0;
     let epoch_hash = genesis_block.hash();
     next_state(&mut state, &data_man_replay, &epoch_hash, height);
-    serialize_into_file_wrapped(
-        STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
-        &StateKVTraceItem::Epoch(epoch_hash),
-    ).unwrap();
-    let mut last_committed_height = height;
     height += 1;
 
-    let mut not_executed_drop_cnt = 0;
-    let mut not_executed_to_reconsider_packing_cnt = 0;
-    let mut execution_error_bump_nonce_cnt = 0;
-    let mut finished_cnt = 0;
-
-    let mut line = String::new();
-    while let Ok(_) = trace_reader.read_line(&mut line) {
-        if line.len() == 0 {
+    while let Ok(wrapper) =
+        bincode::deserialize_from::<_, Wrapper>(&mut trace_reader)
+    {
+        let trace: StateKVTraceItem = bincode::deserialize(&wrapper.data).unwrap();
+        // println!("{:?}", trace);
+        if let StateKVTraceItem::Epoch(_) = trace {
             break;
         }
-        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
-        for block_trace in epoch_trace.block_traces {
-            let spec = machine.spec(block_trace.env.number);
-            state.bump_block_number_accumulate_interest();
-            initialize_internal_contract_accounts(
-                &mut state,
-                machine.internal_contracts().initialized_at(block_trace.env.number),
-                spec.contract_start_nonce,
-            );
-            for mut transaction in block_trace.transactions {
-                transaction.transaction.compute_hash();
-                serialize_into_file_wrapped(
-                    STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
-                    &StateKVTraceItem::Transaction(transaction.hash()),
-                ).unwrap();
-                let exe_res = Executive::new(
-                    &mut state,
-                    &block_trace.env,
-                    machine.as_ref(),
-                    &spec,
-                ).transact(&transaction, TransactOptions::with_no_tracing());
-                let exe_res = exe_res.unwrap();
-                match exe_res
-                {
-                    ExecutionOutcome::NotExecutedDrop(_) => {
-                        not_executed_drop_cnt += 1;
+    }
+    while let Ok(wrapper) =
+        bincode::deserialize_from::<_, Wrapper>(&mut trace_reader)
+    {
+        let trace: StateKVTraceItem = bincode::deserialize(&wrapper.data).unwrap();
+        // println!("{:?}", trace);
+        match trace {
+            StateKVTraceItem::Epoch(epoch_hash) => {
+                commit_state(&mut state, &data_man_replay, &epoch_hash);
+                next_state(&mut state, &data_man_replay, &epoch_hash, height);
+                if height % 1000 == 0 {
+                    println!("{}", height);
+                    if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
+                        return;
                     }
-                    ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
-                        not_executed_to_reconsider_packing_cnt += 1;
-                    }
-                    ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
-                        execution_error_bump_nonce_cnt += 1;
-                    }
-                    ExecutionOutcome::Finished(_) => {
-                        finished_cnt += 1;
-                    }
+                }
+                height += 1;
+            }
+            StateKVTraceItem::Transaction(_) => {}
+            StateKVTraceItem::Reward(_, _) => {}
+            StateKVTraceItem::Get(key) => {
+                state.db.storage.get(key).unwrap();
+            }
+            StateKVTraceItem::Set(key, value) => {
+                state.db.storage.set(key, Box::from(value)).unwrap();
+            }
+            StateKVTraceItem::Delete(key) => {
+                state.db.storage.delete(key).unwrap();
+            }
+            StateKVTraceItem::DeletaAll(key, is_read_only) => {
+                if is_read_only {
+                    state.db.storage.delete_all::<access_mode::Read>(key).unwrap();
+                } else {
+                    state.db.storage.delete_all::<access_mode::Write>(key).unwrap();
                 }
             }
         }
-        let mut merged_rewards = BTreeMap::new();
-        for reward in epoch_trace.rewards {
-            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
-        }
-        for (address, reward) in merged_rewards {
-            serialize_into_file_wrapped(
-                STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
-                &StateKVTraceItem::Reward(address, reward),
-            ).unwrap();
-            state.add_balance(
-                &address, &reward, CleanupMode::ForceCreate, U256::zero()
-            ).unwrap();
-        }
-        state.add_total_issued(epoch_trace.newly_issued);
-        let epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash);
-        next_state(&mut state, &data_man_replay, &epoch_hash, height);
-        serialize_into_file_wrapped(
-            STATE_KV_TRACE_WRITER.lock().unwrap().get_ref(),
-            &StateKVTraceItem::Epoch(epoch_trace.epoch_hash),
-        ).unwrap();
-        last_committed_height = height;
-        height += 1;
-        line.clear();
     }
-    height -= 1;
-    if last_committed_height < height {
-        let epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash);
-    }
-
-    println!("NotExecutedDrop: {}\n\
-        NotExecutedToReconsiderPacking: {}\n\
-        ExecutionErrorBumpNonce: {}\n\
-        Finished: {}",
-        not_executed_drop_cnt,
-        not_executed_to_reconsider_packing_cnt,
-        execution_error_bump_nonce_cnt,
-        finished_cnt
-    );
-    std::fs::rename("state_kv_trace_tmp", "state_kv_trace").unwrap();
 }
 
 fn open_db(conf: &Configuration)
@@ -261,13 +208,71 @@ fn open_db(conf: &Configuration)
     (data_man, state, genesis_block, machine)
 }
 
+fn get_state_no_commit_by_epoch_hash(
+    data_man: &BlockDataManager,
+    epoch_hash: &H256
+) -> State
+{
+    State::new(StateDb::new(
+        data_man
+        .storage_manager
+        .get_state_no_commit(
+            data_man.get_state_readonly_index(epoch_hash).unwrap(),
+            false
+        ).unwrap().unwrap()
+    )).unwrap()
+}
+
+fn check_state(
+    data_man_replay: &BlockDataManager,
+    epoch_hash_replay: &H256,
+    data_man_ori: &BlockDataManager,
+    epoch_height: u64,
+    addresses: &Vec<Address>
+) -> bool
+{
+    let state_replay = get_state_no_commit_by_epoch_hash(
+        data_man_replay, epoch_hash_replay);
+    let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_id = epoch_hashes.last().unwrap();
+    let state_ori = get_state_no_commit_by_epoch_hash(
+        data_man_ori, &epoch_id);
+
+    let mut wrong = false;
+    for address in addresses {
+        let ori_balance = state_ori.balance(address).unwrap();
+        let cur_balance = state_replay.balance(address).unwrap();
+        if ori_balance != cur_balance {
+            println!("Error: epoch_height {}, address {:x}: ori_balance = {}, cur_balance = {}",
+                epoch_height, address, ori_balance, cur_balance);
+            wrong = true;
+        } else {
+            // println!("{} good", address);
+        }
+
+        // state must have been committed
+        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
+        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
+        if ori_storage_root != cur_storage_root {
+            println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
+                epoch_height, address, ori_storage_root, cur_storage_root);
+            wrong = true;
+        } else {
+            // println!("storage_root of address {:x} is good", address);
+        }
+    }
+    return wrong;
+}
+
 fn commit_state(
     state: &mut State,
     data_man: &BlockDataManager,
     epoch_hash: &H256,
 )
 {
-    let state_root = state.commit(epoch_hash.clone(), None).unwrap();
+    let state_root = state.db.storage.compute_state_root().unwrap();
+    state.db.storage.commit(epoch_hash.clone()).unwrap();
+    // let state_root = state.commit(epoch_hash.clone(), None).unwrap();
     data_man.insert_epoch_execution_commitment(
         epoch_hash.clone(),
         state_root,
@@ -561,4 +566,20 @@ fn genesis_state(
     // );
     println!("Hash of genesis: {:x}", genesis.hash());
     (genesis, state)
+}
+
+fn read_addresses(address_path: &str) -> Vec<Address> {
+    let address_file = File::open(address_path).unwrap();
+    let mut address_reader = BufReader::new(address_file);
+    let mut ret = Vec::new();
+    let mut line = String::new();
+    while let Ok(_) = address_reader.read_line(&mut line) {
+        if line.len() == 0 {
+            break;
+        }
+        let address: Address = line.parse().unwrap();
+        line.clear();
+        ret.push(address);
+    }
+    ret
 }
