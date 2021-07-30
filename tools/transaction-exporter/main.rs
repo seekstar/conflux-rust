@@ -98,7 +98,7 @@ fn main() {
             });
             let reward = match data_man
                 .block_reward_result_by_hash_with_epoch(
-                    &hash, &epoch_later, false, true)
+                    &hash, &epoch_later, false, false)
             {
                 None => { break 'epoch_loop }
                 Some(reward) => { reward }
