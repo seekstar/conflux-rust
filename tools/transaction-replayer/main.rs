@@ -216,6 +216,12 @@ fn main() {
         //     return;
         // }
         line.clear();
+        if height % 2000 == 0 {
+            let keep = 2000 * 50;
+            if height > keep {
+                cleanup_snapshots(&data_man_replay, height - keep);
+            }
+        }
         height += 1;
     }
     height -= 1;
@@ -377,6 +383,27 @@ fn next_state(
             )
         ).unwrap().unwrap()
     )).unwrap();
+}
+
+fn cleanup_snapshots(data_man: &BlockDataManager, height_keep: u64) {
+    let storage = data_man.storage_manager.get_storage_manager();
+    let mut old_pivot_snapshot_infos_to_remove = Vec::new();
+    let mut old_pivot_snapshots_to_remove = Vec::new();
+    let current_snapshots = storage.current_snapshots.read();
+    for snapshot_info in current_snapshots.iter() {
+        let snapshot_epoch_id = snapshot_info.get_snapshot_epoch_id();
+        if snapshot_info.height < height_keep {
+            old_pivot_snapshot_infos_to_remove
+                .push(snapshot_epoch_id.clone());
+            old_pivot_snapshots_to_remove
+                .push(snapshot_epoch_id.clone());
+        }
+    }
+    storage.remove_snapshots(
+        &old_pivot_snapshots_to_remove,
+        &Vec::new(),
+        &old_pivot_snapshot_infos_to_remove.drain(..).collect(),
+    ).unwrap();
 }
 
 fn genesis_state(

@@ -122,7 +122,7 @@ pub struct StorageManager {
     // Lock order: while this is locked, in load_persist_state and
     // state_manager.rs:get_state_trees_for_next_epoch
     // snapshot_associated_mpts_by_epoch is locked later.
-    current_snapshots: RwLock<Vec<SnapshotInfo>>,
+    pub current_snapshots: RwLock<Vec<SnapshotInfo>>,
     // Lock order: while this is locked, in register_new_snapshot and
     // load_persist_state, current_snapshots and
     // snapshot_associated_mpts_by_epoch are locked later.
@@ -130,7 +130,7 @@ pub struct StorageManager {
 
     last_confirmed_snapshottable_epoch_id: Mutex<Option<EpochId>>,
 
-    storage_conf: StorageConfiguration,
+    pub storage_conf: StorageConfiguration,
 }
 
 impl MallocSizeOf for StorageManager {
@@ -1220,7 +1220,7 @@ impl StorageManager {
         Ok(())
     }
 
-    fn remove_snapshots(
+    pub fn remove_snapshots(
         &self, old_pivot_snapshots_to_remove: &[EpochId],
         non_pivot_snapshots_to_remove: &[EpochId],
         snapshot_infos_to_remove: &HashSet<EpochId>,
