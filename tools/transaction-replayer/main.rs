@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, VecDeque},
     fs::File,
     io::{
         BufReader,
@@ -7,7 +8,6 @@ use std::{
     sync::{Arc},
     str::FromStr,
     time::{Instant, Duration},
-    collections::HashMap,
 };
 
 use threadpool::ThreadPool;
@@ -130,7 +130,7 @@ fn main() {
 
     let (data_man_ori, _, _, _) = open_db(&conf);
     conf.raw_conf.conflux_data_dir = "./replay_data".into();
-    let _ = std::fs::remove_dir_all(&conf.raw_conf.conflux_data_dir);
+    remove_dir_content(&conf.raw_conf.conflux_data_dir);
     let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
 
     let mut transaction_executed: usize = 0;
@@ -146,6 +146,9 @@ fn main() {
     let mut not_executed_to_reconsider_packing_cnt = 0;
     let mut execution_error_bump_nonce_cnt = 0;
     let mut finished_cnt = 0;
+
+    const DELETE_COMMITMENT_DELAY: usize = 100000;
+    let mut prev_epoches = VecDeque::with_capacity(DELETE_COMMITMENT_DELAY);
 
     let mut line = String::new();
     while let Ok(_) = trace_reader.read_line(&mut line) {
@@ -211,12 +214,17 @@ fn main() {
         epoch_hash = H256::random();
         commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
         next_state(&mut state, &data_man_replay, &epoch_hash, height);
+        if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
+            data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
+        }
+        prev_epoches.push_back(epoch_hash);
         last_committed_height = height;
         // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
         //     return;
         // }
         line.clear();
         if height % 2000 == 0 {
+            println!("{}", height);
             let keep = 2000 * 50;
             if height > keep {
                 cleanup_snapshots(&data_man_replay, height - keep);
@@ -686,4 +694,20 @@ fn read_addresses(address_path: &str) -> Vec<Address> {
         ret.push(address);
     }
     ret
+}
+
+fn remove_dir_content(path: &str) {
+    if let Ok(rdir) = std::fs::read_dir(path) {
+        for entry in rdir {
+            if let Ok(entry) = entry {
+                if let Ok(ftype) = entry.file_type() {
+                    if ftype.is_dir() {
+                        std::fs::remove_dir_all(entry.path()).unwrap();
+                    } else {
+                        std::fs::remove_file(entry.path()).unwrap();
+                    }
+                }
+            }
+        }
+    }
 }
