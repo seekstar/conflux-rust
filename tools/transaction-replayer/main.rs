@@ -204,12 +204,12 @@ async fn main() {
                     }
                 }
                 transaction_executed += 1;
+                transaction_executed_total.fetch_add(
+                    1,
+                    Ordering::Relaxed,
+                );
                 if transaction_executed == commit_interval {
                     transaction_executed = 0;
-                    transaction_executed_total.fetch_add(
-                        commit_interval as u64,
-                        Ordering::Relaxed,
-                    );
                 }
             }
         }
