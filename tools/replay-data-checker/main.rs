@@ -43,14 +43,11 @@ use cfxcore::{
     verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
-    state_trait::StateOpsTrait,
+    state_trait::{StateOpsTxTrait, StateOpsTrait},
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::{
-    StateDb,
-    StateDbGetOriginalMethods,
-};
+use cfx_statedb::StateDb;
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
@@ -181,17 +178,6 @@ fn check_state(
             wrong = true;
         } else {
             // println!("{} good", address);
-        }
-
-        // state must have been committed
-        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
-        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
-        if ori_storage_root != cur_storage_root {
-            println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
-                epoch_height, address, ori_storage_root, cur_storage_root);
-            wrong = true;
-        } else {
-            // println!("storage_root of address {:x} is good", address);
         }
     }
     return wrong;

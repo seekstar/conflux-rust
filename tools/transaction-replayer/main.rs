@@ -55,14 +55,11 @@ use cfxcore::{
     verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
-    state_trait::StateOpsTrait,
+    state_trait::{StateOpsTxTrait, StateOpsTrait},
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::{
-    StateDb,
-    StateDbGetOriginalMethods,
-};
+use cfx_statedb::StateDb;
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,

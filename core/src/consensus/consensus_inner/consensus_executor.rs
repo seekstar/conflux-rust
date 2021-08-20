@@ -17,14 +17,15 @@ use crate::{
     },
     executive::{
         revert_reason_decode, ExecutionError, ExecutionOutcome, Executive,
-        TransactOptions,
+        ExecutiveGeneric, TransactOptions,
     },
     machine::Machine,
     rpc_errors::{invalid_params_check, Result as RpcResult},
     spec::genesis::initialize_internal_contract_accounts,
     state::{
         prefetcher::{
-            prefetch_accounts, ExecutionStatePrefetcher, PrefetchTaskHandle,
+            prefetch_accounts_worker, ExecutionStatePrefetcher,
+            StateWithWaiters,
         },
         State,
     },
@@ -44,7 +45,7 @@ use cfx_state::{state_trait::*, CleanupMode};
 use cfx_statedb::{Result as DbResult, StateDb};
 use cfx_storage::{
     defaults::DEFAULT_EXECUTION_PREFETCH_THREADS, StateIndex,
-    StorageManagerTrait,
+    StorageManagerTrait, StorageState,
 };
 use cfx_types::{
     address_util::AddressUtil, BigEndianHash, H160, H256, KECCAK_EMPTY_BLOOM,
@@ -53,7 +54,7 @@ use cfx_types::{
 use core::convert::TryFrom;
 use hash::KECCAK_EMPTY_LIST_RLP;
 use metrics::{register_meter_with_group, Meter, MeterTimer};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use primitives::{
     compute_block_number,
     receipt::{
@@ -62,8 +63,8 @@ use primitives::{
         TRANSACTION_OUTCOME_EXCEPTION_WITH_NONCE_BUMPING,
         TRANSACTION_OUTCOME_SUCCESS,
     },
-    Action, Block, BlockHeaderBuilder, EpochId, SignedTransaction,
-    TransactionIndex, MERKLE_NULL_NODE,
+    Action, Block, BlockHeaderBuilder, SignedTransaction, TransactionIndex,
+    MERKLE_NULL_NODE,
 };
 use rustc_hex::ToHex;
 use std::{
@@ -71,7 +72,10 @@ use std::{
     convert::From,
     fmt::{Debug, Formatter},
     sync::{
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{
+            AtomicBool,
+            Ordering::{self, Relaxed},
+        },
         mpsc::{channel, RecvError, Sender, TryRecvError},
         Arc,
     },
@@ -822,7 +826,7 @@ impl ConsensusExecutionHandler {
             execution_state_prefetcher: if DEFAULT_EXECUTION_PREFETCH_THREADS
                 > 0
             {
-                Some(
+                Some(Arc::new(
                     ExecutionStatePrefetcher::new(
                         DEFAULT_EXECUTION_PREFETCH_THREADS,
                     )
@@ -830,7 +834,7 @@ impl ConsensusExecutionHandler {
                         // Do not accept error at starting up.
                         &concat!(file!(), ":", line!(), ":", column!()),
                     ),
-                )
+                ))
             } else {
                 None
             },
@@ -908,6 +912,17 @@ impl ConsensusExecutionHandler {
         // FIXME: Question: where to calculate if we should make a snapshot?
         // FIXME: Currently we make the snapshotting decision when committing
         // FIXME: a new state.
+
+        // persist block number index
+        // note: we need to persist before execution because in some cases,
+        // execution is skipped. when `compute_epoch` is called, it is
+        // guaranteed that `epoch_hash` is on the current pivot chain.
+        for (index, hash) in epoch_block_hashes.iter().enumerate() {
+            self.data_man.insert_hash_by_block_number(
+                compute_block_number(start_block_number, index as u64),
+                hash,
+            );
+        }
 
         // Check if the state has been computed
         if !force_recompute
@@ -1005,7 +1020,6 @@ impl ConsensusExecutionHandler {
 
         let epoch_receipts = self
             .process_epoch_transactions(
-                *epoch_hash,
                 &mut state,
                 &epoch_blocks,
                 start_block_number,
@@ -1057,14 +1071,6 @@ impl ConsensusExecutionHandler {
             BlockHeaderBuilder::compute_block_logs_bloom_hash(&epoch_receipts),
         );
 
-        // persist block number index
-        for (index, hash) in epoch_block_hashes.iter().enumerate() {
-            self.data_man.insert_hash_by_block_number(
-                compute_block_number(start_block_number, index as u64),
-                hash,
-            );
-        }
-
         let epoch_execution_commitment = self
             .data_man
             .get_epoch_execution_commitment(&epoch_hash)
@@ -1079,48 +1085,12 @@ impl ConsensusExecutionHandler {
             .adjust_upper_bound(&pivot_block.block_header);
     }
 
-    fn process_epoch_transactions(
-        &self, epoch_id: EpochId, state: &mut State,
+    fn process_epoch_transactions_prefetch(
+        &self, state: &mut StateWithWaiters<StorageState>,
         epoch_blocks: &Vec<Arc<Block>>, start_block_number: u64,
         on_local_pivot: bool,
     ) -> DbResult<Vec<Arc<BlockReceipts>>>
     {
-        // Prefetch accounts for transactions.
-        // The return value _prefetch_join_handles is used to join all threads
-        // before the exit of this function.
-        let prefetch_join_handles = match self
-            .execution_state_prefetcher
-            .as_ref()
-        {
-            Some(prefetcher) => {
-                let mut accounts = vec![];
-                for block in epoch_blocks.iter() {
-                    for transaction in block.transactions.iter() {
-                        accounts.push(&transaction.sender);
-                        match transaction.action {
-                            Action::Call(ref address) => accounts.push(address),
-                            _ => {}
-                        }
-                    }
-                }
-
-                prefetch_accounts(prefetcher, epoch_id, state, accounts)
-            }
-            None => PrefetchTaskHandle {
-                task_epoch_id: epoch_id,
-                state,
-                prefetcher: None,
-                accounts: vec![],
-            },
-        };
-        // TODO:
-        //   Make the state shared ref for vm execution, then remove this drop.
-        //   When the state can be made shared, prefetch can happen at the same
-        //   time of the execution, the vm execution do not have to wait
-        //   for prefetching to finish.
-        prefetch_join_handles.wait_for_task();
-        drop(prefetch_join_handles);
-
         let pivot_block = epoch_blocks.last().expect("Epoch not empty");
         let mut epoch_receipts = Vec::with_capacity(epoch_blocks.len());
         let mut to_pending = Vec::new();
@@ -1170,12 +1140,22 @@ impl ConsensusExecutionHandler {
 
                 let r = if self.config.executive_trace {
                     let options = TransactOptions::with_tracing();
-                    Executive::new(state, &env, self.machine.as_ref(), &spec)
-                        .transact(transaction, options)?
+                    ExecutiveGeneric::new(
+                        state,
+                        &env,
+                        self.machine.as_ref(),
+                        &spec,
+                    )
+                    .transact(transaction, options)?
                 } else {
                     let options = TransactOptions::with_no_tracing();
-                    Executive::new(state, &env, self.machine.as_ref(), &spec)
-                        .transact(transaction, options)?
+                    ExecutiveGeneric::new(
+                        state,
+                        &env,
+                        self.machine.as_ref(),
+                        &spec,
+                    )
+                    .transact(transaction, options)?
                 };
 
                 let gas_fee;
@@ -1334,6 +1314,77 @@ impl ConsensusExecutionHandler {
 
         debug!("Finish processing tx for epoch");
         Ok(epoch_receipts)
+    }
+
+    fn process_epoch_transactions(
+        &self, state: &mut State, epoch_blocks: &Vec<Arc<Block>>,
+        start_block_number: u64, on_local_pivot: bool,
+    ) -> DbResult<Vec<Arc<BlockReceipts>>>
+    {
+        // Prefetch accounts for transactions.
+        // The return value _prefetch_join_handles is used to join all threads
+        // before the exit of this function.
+        let prefetcher = self.execution_state_prefetcher.as_ref().unwrap(); // TODO: Remove the unwrap
+        let mut accounts = vec![];
+        for block in epoch_blocks.iter() {
+            for transaction in block.transactions.iter() {
+                accounts.push(&transaction.sender);
+                match transaction.action {
+                    Action::Call(ref address) => accounts.push(address),
+                    _ => {}
+                }
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let io = &state.io;
+        let info = &mut state.info;
+        prefetcher.pool.in_place_scope(|s| {
+            let num_accounts = accounts.len();
+            let max_workers = 4;
+            let mut thread_idx = 0;
+            let mut range_start = num_accounts * thread_idx / max_workers;
+            let mut range_end = num_accounts * (thread_idx + 1) / max_workers;
+            let mut address_waiters_map = HashMap::new();
+            let mut address_waiters_vec =
+                Vec::with_capacity(range_end - range_start);
+            for (i, addr) in accounts.iter().enumerate() {
+                if i == range_end {
+                    s.spawn(|_| {
+                        prefetch_accounts_worker(
+                            io,
+                            address_waiters_vec,
+                            &cancel,
+                        )
+                    });
+                    thread_idx += 1;
+                    range_start = num_accounts * thread_idx / max_workers;
+                    range_end = num_accounts * (thread_idx + 1) / max_workers;
+                    address_waiters_vec =
+                        Vec::with_capacity(range_end - range_start);
+                }
+                let waiter = Arc::new((Mutex::new(false), Condvar::new()));
+                address_waiters_map.insert(*addr, waiter.clone());
+                address_waiters_vec.push((*addr, waiter));
+            }
+            s.spawn(|_| {
+                prefetch_accounts_worker(io, address_waiters_vec, &cancel)
+            });
+            let mut state = StateWithWaiters {
+                io,
+                info,
+                address_waiters: address_waiters_map,
+            };
+            // let mut state = spawn_prefetch_workers(s, state, &accounts,
+            // &cancel, 4);
+            let res = self.process_epoch_transactions_prefetch(
+                &mut state,
+                epoch_blocks,
+                start_block_number,
+                on_local_pivot,
+            );
+            cancel.store(true, Ordering::Relaxed);
+            res
+        })
     }
 
     fn compute_block_base_reward(
@@ -1691,7 +1742,6 @@ impl ConsensusExecutionHandler {
                 .unwrap(),
         ))?;
         self.process_epoch_transactions(
-            *pivot_hash,
             &mut state,
             &epoch_blocks,
             start_block_number,
