@@ -56,6 +56,7 @@ cfx-statedb = { path = "core/statedb" }
 cfx-storage = { path = "core/storage" }
 cfx-parameters = { path = "core/parameters" }
 cfx-state = { path = "core/state" }
+tokio = { version = "1.10", features = ["full"] }
 
 [[bin]]
 name = "consensus_bench"
@@ -80,6 +81,10 @@ path = "tools/transaction-exporter/main.rs"
 [[bin]]
 name = "transaction-replayer"
 path = "tools/transaction-replayer/main.rs"
+
+[[bin]]
+name = "replay-data-checker"
+path = "tools/replay-data-checker/main.rs"
 
 # Use workspace section to allow test all cases under root folder (cargo test --all).
 [workspace]

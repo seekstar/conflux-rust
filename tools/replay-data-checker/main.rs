@@ -1,27 +1,20 @@
 use std::{
-    collections::{HashMap, VecDeque},
     fs::File,
     io::{
         BufReader,
         BufRead,
-        BufWriter,
-        Write,
     },
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{Arc},
     str::FromStr,
-    time::{Instant, Duration},
 };
 
 use threadpool::ThreadPool;
 use parking_lot::Mutex;
 use clap::{App, Arg};
 use rustc_hex::FromHex;
-use serde::Deserialize;
-use tokio::{self, time};
 
 use cfx_types::{H256, U256, Address, address_util::AddressUtil};
 use primitives::{
-    SignedTransaction,
     Transaction,
     Action,
     Block,
@@ -45,13 +38,8 @@ use cfxcore::{
     machine::{new_machine_with_builtin, Machine},
     pow::PowComputer,
     BlockDataManager,
-    executive::{
-        Executive,
-        contract_address,
-        TransactOptions,
-        ExecutionOutcome,
-    },
-    vm::{Env, CreateContractAddress},
+    executive::contract_address,
+    vm::CreateContractAddress,
     verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
@@ -66,7 +54,6 @@ use cfx_statedb::{
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
-    StateIndex,
 };
 use cfx_parameters::{
     consensus::{
@@ -83,25 +70,7 @@ use client::configuration::Configuration;
 
 const GENESIS_VERSION: &str = "1949000000000000000000000000000000001001";
 
-extern crate serde_json;
-
-#[derive(Deserialize)]
-struct BlockTrace {
-    transactions: Vec<SignedTransaction>,
-    env: Env,
-}
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct EpochTrace {
-    epoch_hash: H256,
-    block_traces: Vec<BlockTrace>,
-    rewards: Vec<(Address, U256)>,
-    new_mint: U256,
-    burnt_fee: U256,
-}
-
-#[tokio::main]
-async fn main() {
+fn main() {
     let arg_matches = App::new("Conflux transaction replayer")
         .arg(
             Arg::with_name("data-dir")
@@ -112,184 +81,22 @@ async fn main() {
                 .takes_value(true)
                 .default_value("."),
         ).arg(
-            Arg::with_name("commit-interval")
-                .short("i")
-                .long("commit-interval")
-                .value_name("commit-interval")
-                .help("Commit every <commit-interval> transactions")
-                .takes_value(true)
-                .default_value("100"),
-        ).arg(
-            Arg::with_name("perf-log")
-                .long("perf-log")
-                .value_name("perf-log")
-                .help("Path to save perf log")
-                .takes_value(true)
-                .default_value("perf-log.txt"),
+            Arg::with_name("epoch-number")
+                .short("n")
+                .long("epoch-number")
+                .value_name("epoch-number")
+                .takes_value(true),
         ).get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
-    let commit_interval: usize =
-        arg_matches.value_of("commit-interval").unwrap().parse().unwrap();
-    let perf_log_path = arg_matches.value_of("perf-log").unwrap();
-    let trace_path = format!("{}/trace.txt", dir);
+    let height = arg_matches.value_of("epoch-number").unwrap().parse().unwrap();
     let address_path = format!("{}/address.txt", dir);
-    let trace_file = File::open(trace_path).unwrap();
-    let mut trace_reader = BufReader::new(trace_file);
-    let perf_log_file = File::create(perf_log_path).unwrap();
-    let perf_log_writer = Arc::new(Mutex::new(BufWriter::new(perf_log_file)));
-
     let addresses = read_addresses(&address_path);
-
     let (data_man_ori, _, _, _) = open_db(&conf);
     conf.raw_conf.conflux_data_dir = "./replay_data".into();
-    remove_dir_content(&conf.raw_conf.conflux_data_dir);
-    let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
-
-    let mut transaction_executed: usize = 0;
-    let transaction_executed_total = Arc::new(AtomicU64::new(0));
-    let mut transact_time = Duration::from_secs(0);
-    let mut commit_time = Duration::from_secs(0);
-    let mut height = 0;
-    let mut epoch_hash = genesis_block.hash();
-    next_state(&mut state, &data_man_replay, &epoch_hash, height);
-    let mut last_committed_height = height;
-    height += 1;
-
-    let mut not_executed_drop_cnt = 0;
-    let mut not_executed_to_reconsider_packing_cnt = 0;
-    let mut execution_error_bump_nonce_cnt = 0;
-    let mut finished_cnt = 0;
-
-    const DELETE_COMMITMENT_DELAY: usize = 100000;
-    let mut prev_epoches = VecDeque::with_capacity(DELETE_COMMITMENT_DELAY);
-
-    tokio::spawn(print_transaction_executed(perf_log_writer.clone(), transaction_executed_total.clone()));
-
-    let mut line = String::new();
-    while let Ok(_) = trace_reader.read_line(&mut line) {
-        if line.len() == 0 {
-            break;
-        }
-        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
-        for block_trace in epoch_trace.block_traces {
-            let spec = machine.spec(block_trace.env.number);
-            state.bump_block_number_accumulate_interest();
-            initialize_internal_contract_accounts(
-                &mut state,
-                machine.internal_contracts().initialized_at(block_trace.env.number),
-                spec.contract_start_nonce,
-            );
-            for transaction in block_trace.transactions {
-                let now = Instant::now();
-                let exe_res = Executive::new(
-                    &mut state,
-                    &block_trace.env,
-                    machine.as_ref(),
-                    &spec,
-                ).transact(&transaction, TransactOptions::with_no_tracing());
-                transact_time += now.elapsed();
-                let exe_res = exe_res.unwrap();
-                match exe_res
-                {
-                    ExecutionOutcome::NotExecutedDrop(_) => {
-                        not_executed_drop_cnt += 1;
-                    }
-                    ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
-                        not_executed_to_reconsider_packing_cnt += 1;
-                    }
-                    ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
-                        execution_error_bump_nonce_cnt += 1;
-                    }
-                    ExecutionOutcome::Finished(_) => {
-                        finished_cnt += 1;
-                    }
-                }
-                transaction_executed += 1;
-                if transaction_executed == commit_interval {
-                    transaction_executed = 0;
-                    transaction_executed_total.fetch_add(
-                        commit_interval as u64,
-                        Ordering::Relaxed,
-                    );
-                }
-            }
-        }
-        let mut merged_rewards = HashMap::new();
-        for reward in epoch_trace.rewards {
-            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
-        }
-        for (address, reward) in merged_rewards {
-            state.add_balance(
-                &address, &reward, CleanupMode::ForceCreate, U256::zero()
-            ).unwrap();
-        }
-        if epoch_trace.new_mint > epoch_trace.burnt_fee {
-            state.add_total_issued(epoch_trace.new_mint - epoch_trace.burnt_fee);
-        } else {
-            state.subtract_total_issued(
-                epoch_trace.burnt_fee - epoch_trace.new_mint
-            );
-        }
-        epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
-        next_state(&mut state, &data_man_replay, &epoch_hash, height);
-        if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
-            data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
-        }
-        prev_epoches.push_back(epoch_hash);
-        data_man_replay.insert_executed_epoch_set_hashes_to_db(height, &vec![epoch_hash]);
-        last_committed_height = height;
-        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        //     return;
-        // }
-        line.clear();
-        if height % 2000 == 0 {
-            writeln!(perf_log_writer.lock(), "epoch {}", height).unwrap();
-            println!("epoch {}", height);
-            let keep = 2000 * 50;
-            if height > keep {
-                cleanup_snapshots(&data_man_replay, height - keep);
-            }
-        }
-        height += 1;
-    }
-    height -= 1;
-
-    println!("height: {}\n\
-        NotExecutedDrop: {}\n\
-        NotExecutedToReconsiderPacking: {}\n\
-        ExecutionErrorBumpNonce: {}\n\
-        Finished: {}",
-        height,
-        not_executed_drop_cnt,
-        not_executed_to_reconsider_packing_cnt,
-        execution_error_bump_nonce_cnt,
-        finished_cnt
-    );
-    println!("transact_time: {} ms\n\
-        commit_time: {} ms",
-        transact_time.as_millis(),
-        commit_time.as_millis());
-
-    if last_committed_height < height {
-        epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
-    }
-    if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        return;
-    }
-}
-
-async fn print_transaction_executed(perf_log_writer: Arc<Mutex<BufWriter<File>>>, cnt: Arc<AtomicU64>) {
-    let start_time = Instant::now();
-    let mut interval = time::interval(time::Duration::from_secs(1));
-    loop {
-        interval.tick().await;
-        writeln!(perf_log_writer.lock(), "tx-exe {} {}", start_time.elapsed().as_millis(), cnt.load(Ordering::Relaxed)).unwrap();
-        println!("tx-exe {} {}", start_time.elapsed().as_millis(), cnt.load(Ordering::Relaxed));
-    }
+    let (data_man_replay, _, _, _) = open_db(&conf);
+    check_state(&data_man_replay, &data_man_ori, height, &addresses);
 }
 
 fn open_db(conf: &Configuration)
@@ -349,18 +156,20 @@ fn get_state_no_commit_by_epoch_hash(
 
 fn check_state(
     data_man_replay: &BlockDataManager,
-    epoch_hash_replay: &H256,
     data_man_ori: &BlockDataManager,
     epoch_height: u64,
     addresses: &Vec<Address>
 ) -> bool
 {
-    let state_replay = get_state_no_commit_by_epoch_hash(
-        data_man_replay, epoch_hash_replay);
-    let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
-    let epoch_id = epoch_hashes.last().unwrap();
+    let epoch_hashes_ori = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_id_ori = epoch_hashes_ori.last().unwrap();
     let state_ori = get_state_no_commit_by_epoch_hash(
-        data_man_ori, &epoch_id);
+        data_man_ori, &epoch_id_ori);
+
+    let epoch_hashes_replay = data_man_replay.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_id_replay = epoch_hashes_replay.last().unwrap();
+    let state_replay = get_state_no_commit_by_epoch_hash(
+        data_man_replay, epoch_id_replay);
 
     let mut wrong = false;
     for address in addresses {
@@ -373,72 +182,19 @@ fn check_state(
         } else {
             // println!("{} good", address);
         }
-    }
-    return wrong;
-}
 
-fn commit_state(
-    state: &mut State,
-    data_man: &BlockDataManager,
-    epoch_hash: &H256,
-    commit_time: &mut Duration,
-)
-{
-    let now = Instant::now();
-    let state_root = state.commit(epoch_hash.clone(), None).unwrap();
-    data_man.insert_epoch_execution_commitment(
-        epoch_hash.clone(),
-        state_root,
-        H256::zero(),
-        H256::zero(),
-    );
-    *commit_time += now.elapsed();
-}
-
-fn next_state(
-    state: &mut State,
-    data_man: &BlockDataManager,
-    epoch_hash: &H256,
-    height: u64)
-{
-    *state = State::new(StateDb::new(
-        data_man
-        .storage_manager
-        .get_state_for_next_epoch(
-            StateIndex::new_for_next_epoch(
-                epoch_hash,
-                &data_man
-                .get_epoch_execution_commitment(epoch_hash)
-                .unwrap()
-                .state_root_with_aux_info,
-                height,
-                data_man.get_snapshot_epoch_count()
-            )
-        ).unwrap().unwrap()
-    )).unwrap();
-}
-
-fn cleanup_snapshots(data_man: &BlockDataManager, height_keep: u64) {
-    let storage = data_man.storage_manager.get_storage_manager();
-    let mut old_pivot_snapshot_infos_to_remove = Vec::new();
-    let mut old_pivot_snapshots_to_remove = Vec::new();
-    {
-        let current_snapshots = storage.current_snapshots.read();
-        for snapshot_info in current_snapshots.iter() {
-            let snapshot_epoch_id = snapshot_info.get_snapshot_epoch_id();
-            if snapshot_info.height < height_keep {
-                old_pivot_snapshot_infos_to_remove
-                    .push(snapshot_epoch_id.clone());
-                old_pivot_snapshots_to_remove
-                    .push(snapshot_epoch_id.clone());
-            }
+        // state must have been committed
+        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
+        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
+        if ori_storage_root != cur_storage_root {
+            println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
+                epoch_height, address, ori_storage_root, cur_storage_root);
+            wrong = true;
+        } else {
+            // println!("storage_root of address {:x} is good", address);
         }
     }
-    storage.remove_snapshots(
-        &old_pivot_snapshots_to_remove,
-        &Vec::new(),
-        &old_pivot_snapshot_infos_to_remove.drain(..).collect(),
-    ).unwrap();
+    return wrong;
 }
 
 fn genesis_state(
@@ -719,20 +475,4 @@ fn read_addresses(address_path: &str) -> Vec<Address> {
         ret.push(address);
     }
     ret
-}
-
-fn remove_dir_content(path: &str) {
-    if let Ok(rdir) = std::fs::read_dir(path) {
-        for entry in rdir {
-            if let Ok(entry) = entry {
-                if let Ok(ftype) = entry.file_type() {
-                    if ftype.is_dir() {
-                        std::fs::remove_dir_all(entry.path()).unwrap();
-                    } else {
-                        std::fs::remove_file(entry.path()).unwrap();
-                    }
-                }
-            }
-        }
-    }
 }
