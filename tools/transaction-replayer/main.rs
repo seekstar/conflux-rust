@@ -7,13 +7,14 @@ use std::{
         BufWriter,
         Write,
     },
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    process::{self, Command},
     str::FromStr,
+    sync::Arc,
     time::{Instant, Duration},
 };
 
 use threadpool::ThreadPool;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use clap::{App, Arg};
 use rustc_hex::FromHex;
 use serde::Deserialize;
@@ -59,10 +60,7 @@ use cfx_state::{
     CleanupMode,
     state_trait::StateTrait,
 };
-use cfx_statedb::{
-    StateDb,
-    StateDbGetOriginalMethods,
-};
+use cfx_statedb::StateDb;
 use cfx_storage::{
     StorageManager,
     StorageManagerTrait,
@@ -100,6 +98,11 @@ struct EpochTrace {
     burnt_fee: U256,
 }
 
+struct PerfExecInfo {
+    transaction_executed_total: usize,
+    height: u64,
+}
+
 #[tokio::main]
 async fn main() {
     let arg_matches = App::new("Conflux transaction replayer")
@@ -126,6 +129,12 @@ async fn main() {
                 .help("Path to save perf log")
                 .takes_value(true)
                 .default_value("perf-log.txt"),
+        ).arg(
+            Arg::with_name("start-epoch")
+                .long("start-epoch")
+                .value_name("start-epoch")
+                .help("The epoch number before the first epoch number to replay")
+                .takes_value(true),
         ).get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
@@ -142,18 +151,34 @@ async fn main() {
 
     let addresses = read_addresses(&address_path);
 
-    let (data_man_ori, _, _, _) = open_db(&conf);
-    conf.raw_conf.conflux_data_dir = "./replay_data".into();
-    remove_dir_content(&conf.raw_conf.conflux_data_dir);
-    let (data_man_replay, mut state, genesis_block, machine) = open_db(&conf);
-
     let mut transaction_executed: usize = 0;
-    let transaction_executed_total = Arc::new(AtomicU64::new(0));
     let mut transact_time = Duration::from_secs(0);
     let mut commit_time = Duration::from_secs(0);
-    let mut height = 0;
-    let mut epoch_hash = genesis_block.hash();
-    next_state(&mut state, &data_man_replay, &epoch_hash, height);
+
+    let mut height;
+    let mut epoch_hash;
+    let (data_man_ori, _, _, _) = open_db(&conf);
+    conf.raw_conf.conflux_data_dir = "./replay_data".into();
+    let (data_man_replay, mut state, machine) =
+        if let Some(start_epoch) = arg_matches.value_of("start-epoch") {
+            let (data_man_replay, _, _, machine) = open_db(&conf);
+            height = start_epoch.parse().unwrap();
+            epoch_hash = data_man_replay
+                .executed_epoch_set_hashes_from_db(height)
+                .unwrap()
+                .last()
+                .unwrap()
+                .clone();
+            let state = next_state_from_db(&data_man_replay, &epoch_hash, height);
+            (data_man_replay, state, machine)
+        } else {
+            remove_dir_content(&conf.raw_conf.conflux_data_dir);
+            let (data_man_replay, _, genesis_block, machine) = open_db(&conf);
+            height = 0;
+            epoch_hash = genesis_block.hash();
+            let state = next_state(&data_man_replay, &epoch_hash, height);
+            (data_man_replay, state, machine)
+        };
     let mut last_committed_height = height;
     height += 1;
 
@@ -165,7 +190,11 @@ async fn main() {
     const DELETE_COMMITMENT_DELAY: usize = 100000;
     let mut prev_epoches = VecDeque::with_capacity(DELETE_COMMITMENT_DELAY);
 
-    tokio::spawn(print_transaction_executed(perf_log_writer.clone(), transaction_executed_total.clone()));
+    let perf_exec_info = Arc::new(Mutex::new(PerfExecInfo {
+        transaction_executed_total: 0,
+        height: 1,
+    }));
+    tokio::spawn(print_perf_info(perf_log_writer.clone(), perf_exec_info.clone()));
 
     let mut line = String::new();
     while let Ok(_) = trace_reader.read_line(&mut line) {
@@ -207,10 +236,7 @@ async fn main() {
                     }
                 }
                 transaction_executed += 1;
-                transaction_executed_total.fetch_add(
-                    1,
-                    Ordering::Relaxed,
-                );
+                perf_exec_info.lock().transaction_executed_total += 1;
                 if transaction_executed == commit_interval {
                     transaction_executed = 0;
                 }
@@ -234,7 +260,7 @@ async fn main() {
         }
         epoch_hash = H256::random();
         commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
-        next_state(&mut state, &data_man_replay, &epoch_hash, height);
+        state = next_state(&data_man_replay, &epoch_hash, height);
         if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
             data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
         }
@@ -246,16 +272,16 @@ async fn main() {
         // }
         line.clear();
         if height % 2000 == 0 {
-            writeln!(perf_log_writer.lock(), "epoch {}", height).unwrap();
-            println!("epoch {}", height);
             let keep = 2000 * 50;
             if height > keep {
                 cleanup_snapshots(&data_man_replay, height - keep);
             }
         }
         height += 1;
+        perf_exec_info.lock().height += 1;
     }
     height -= 1;
+    perf_exec_info.lock().height -= 1;
 
     println!("height: {}\n\
         NotExecutedDrop: {}\n\
@@ -282,13 +308,84 @@ async fn main() {
     }
 }
 
-async fn print_transaction_executed(perf_log_writer: Arc<Mutex<BufWriter<File>>>, cnt: Arc<AtomicU64>) {
+fn print_perf_item(writer: &mut MutexGuard<BufWriter<File>>, item: &str) {
+    write!(writer, "{}", item).unwrap();
+    print!("{}", item);
+}
+// TODO: Get the live output of the command "iostat 1"
+fn iostat_to_print() -> std::io::Result<String> {
+    let cmd = "df replay_data | tail -n1 | awk '{print $1}' | sed 's,/dev/,,g' | sed 's,[1-9]*$,,g'";
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output()?;
+    let dev_name = String::from_utf8(output.stdout).unwrap();
+    let mut cmd = "iostat | grep ".to_string();
+    cmd += &dev_name;
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output()?;
+    Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+}
+fn time_to_print() -> std::io::Result<String> {
+    let mut cmd = "/proc/".to_string();
+    cmd += &process::id().to_string();
+    cmd += &"/stat | awk '{print $14,$15,$16,$17}'".to_string();
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .output()?;
+    Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+}
+fn cpu_mem() -> std::io::Result<String> {
+    let output = Command::new("ps")
+        .arg("-q")
+        .arg(process::id().to_string())
+        .arg("-o")
+        .arg("%cpu,%mem")
+        .output()?;
+    let out = String::from_utf8(output.stdout).unwrap();
+    let mut lines = out.lines();
+    lines.next().unwrap(); // Ignore
+    Ok(lines.next().unwrap().to_string())
+}
+fn print_perf_info_once(
+    writer: &mut MutexGuard<BufWriter<File>>,
+    perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
+    start_time: &Instant
+) -> std::io::Result<()> {
+    let perf_exec_info = perf_exec_info.lock();
+    print_perf_item(writer, &format!("{} ", start_time.elapsed().as_millis()));
+    print_perf_item(writer, &format!("{} ", perf_exec_info.height));
+    print_perf_item(
+        writer, 
+        &format!("{} ", perf_exec_info.transaction_executed_total)
+    );
+    print_perf_item(writer, &(iostat_to_print()? + " "));
+    print_perf_item(writer, &(time_to_print()? + " "));
+    print_perf_item(writer, &cpu_mem()?);
+    print_perf_item(writer, "\n");
+    Ok(())
+}
+async fn print_perf_info(
+    perf_log_writer: Arc<Mutex<BufWriter<File>>>,
+    perf_exec_info: Arc<Mutex<PerfExecInfo>>
+) {
     let start_time = Instant::now();
     let mut interval = time::interval(time::Duration::from_secs(1));
+    print_perf_item(
+        &mut perf_log_writer.lock(),
+        "Time(ms) Epoch tx-exe device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
+            utime stime cutime cstime \
+            %cpu %mem\n",
+    );
     loop {
         interval.tick().await;
-        writeln!(perf_log_writer.lock(), "tx-exe {} {}", start_time.elapsed().as_millis(), cnt.load(Ordering::Relaxed)).unwrap();
-        println!("tx-exe {} {}", start_time.elapsed().as_millis(), cnt.load(Ordering::Relaxed));
+        let mut  writer = perf_log_writer.lock();
+        if let Err(err) = print_perf_info_once(&mut writer, &perf_exec_info, &start_time) {
+            print_perf_item(&mut writer, &err.to_string());
+        }
     }
 }
 
@@ -395,27 +492,50 @@ fn commit_state(
     *commit_time += now.elapsed();
 }
 
-fn next_state(
-    state: &mut State,
+fn next_state_from_db(
     data_man: &BlockDataManager,
     epoch_hash: &H256,
-    height: u64)
+    height: u64,
+) -> State
 {
-    *state = State::new(StateDb::new(
+    State::new(StateDb::new(
         data_man
         .storage_manager
         .get_state_for_next_epoch(
             StateIndex::new_for_next_epoch(
                 epoch_hash,
                 &data_man
-                .get_epoch_execution_commitment(epoch_hash)
-                .unwrap()
-                .state_root_with_aux_info,
+                    .load_epoch_execution_commitment_from_db(epoch_hash)
+                    .unwrap()
+                    .state_root_with_aux_info,
                 height,
                 data_man.get_snapshot_epoch_count()
             )
-        ).unwrap().unwrap()
-    )).unwrap();
+        ).unwrap().unwrap(),
+    )).unwrap()
+}
+
+fn next_state(
+    data_man: &BlockDataManager,
+    epoch_hash: &H256,
+    height: u64,
+) -> State
+{
+    State::new(StateDb::new(
+        data_man
+        .storage_manager
+        .get_state_for_next_epoch(
+            StateIndex::new_for_next_epoch(
+                epoch_hash,
+                &data_man
+                    .get_epoch_execution_commitment(epoch_hash)
+                    .unwrap()
+                    .state_root_with_aux_info,
+                height,
+                data_man.get_snapshot_epoch_count()
+            )
+        ).unwrap().unwrap(),
+    )).unwrap()
 }
 
 fn cleanup_snapshots(data_man: &BlockDataManager, height_keep: u64) {
