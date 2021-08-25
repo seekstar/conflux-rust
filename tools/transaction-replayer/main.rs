@@ -342,7 +342,15 @@ fn iostat_to_print() -> std::io::Result<String> {
         .arg("-c")
         .arg(cmd)
         .output()?;
-    Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+    let output = String::from_utf8(output.stdout).unwrap();
+    let mut s = output.trim().split_whitespace();
+    let mut ret = String::new();
+    while let Some(v) = s.next() {
+        ret += v;
+        ret += " ";
+    }
+    ret.pop(); // Returns None if empty
+    Ok(ret)
 }
 fn time_to_print() -> std::io::Result<String> {
     let mut cmd = "cat /proc/".to_string();
