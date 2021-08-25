@@ -345,12 +345,12 @@ fn iostat_to_print() -> std::io::Result<String> {
     Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
 }
 fn time_to_print() -> std::io::Result<String> {
-    let mut cmd = "/proc/".to_string();
+    let mut cmd = "cat /proc/".to_string();
     cmd += &process::id().to_string();
     cmd += &"/stat | awk '{print $14,$15,$16,$17}'".to_string();
     let output = Command::new("bash")
         .arg("-c")
-        .arg(cmd)
+        .arg(&cmd)
         .output()?;
     Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
 }
