@@ -135,6 +135,12 @@ async fn main() {
                 .value_name("start-epoch")
                 .help("The epoch number before the first epoch number to replay")
                 .takes_value(true),
+        ).arg(
+            Arg::with_name("epoch-to-execute")
+                .long("epoch-to-execute")
+                .value_name("epoch-to-execute")
+                .help("The number of epochs to execute")
+                .takes_value(true),
         ).get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
@@ -182,6 +188,10 @@ async fn main() {
     let mut last_committed_height = height;
     height += 1;
 
+    let mut epoch_to_execute = arg_matches
+        .value_of("epoch-to-execute")
+        .map(|v| v.parse::<u64>().unwrap());
+
     let mut not_executed_drop_cnt = 0;
     let mut not_executed_to_reconsider_packing_cnt = 0;
     let mut execution_error_bump_nonce_cnt = 0;
@@ -200,6 +210,12 @@ async fn main() {
     while let Ok(_) = trace_reader.read_line(&mut line) {
         if line.len() == 0 {
             break;
+        }
+        if let Some(v) = epoch_to_execute.as_mut() {
+            if *v == 0 {
+                break;
+            }
+            *v -= 1;
         }
         let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
         for block_trace in epoch_trace.block_traces {
