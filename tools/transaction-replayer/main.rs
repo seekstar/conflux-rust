@@ -9,7 +9,7 @@ use std::{
     },
     process::{self, Command},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Instant, Duration},
 };
 
@@ -18,7 +18,6 @@ use parking_lot::{Mutex, MutexGuard};
 use clap::{App, Arg};
 use rustc_hex::FromHex;
 use serde::Deserialize;
-use tokio::{self, time};
 
 use cfx_types::{H256, U256, Address, address_util::AddressUtil};
 use primitives::{
@@ -103,8 +102,7 @@ struct PerfExecInfo {
     height: u64,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let arg_matches = App::new("Conflux transaction replayer")
         .arg(
             Arg::with_name("data-dir")
@@ -204,7 +202,17 @@ async fn main() {
         transaction_executed_total: 0,
         height: 1,
     }));
-    tokio::spawn(print_perf_info(perf_log_writer.clone(), perf_exec_info.clone()));
+    let perf_info_printer_canceller = Arc::new(AtomicBool::new(false));
+    let perf_info_printer_canceller_cloned = perf_info_printer_canceller.clone();
+    let perf_log_writer_cloned = perf_log_writer.clone();
+    let perf_exec_info_cloned = perf_exec_info.clone();
+    let perf_info_printer = std::thread::spawn(move || {
+        print_perf_info(
+            perf_info_printer_canceller_cloned,
+            perf_log_writer_cloned,
+            perf_exec_info_cloned,
+        )
+    });
 
     let mut line = String::new();
     while let Ok(_) = trace_reader.read_line(&mut line) {
@@ -299,6 +307,9 @@ async fn main() {
     height -= 1;
     perf_exec_info.lock().height -= 1;
 
+    perf_info_printer_canceller.store(true, Ordering::Relaxed);
+    perf_info_printer.join().unwrap();
+
     println!("height: {}\n\
         NotExecutedDrop: {}\n\
         NotExecutedToReconsiderPacking: {}\n\
@@ -328,7 +339,16 @@ fn print_perf_item(writer: &mut MutexGuard<BufWriter<File>>, item: &str) {
     write!(writer, "{}", item).unwrap();
     print!("{}", item);
 }
-// TODO: Get the live output of the command "iostat 1"
+fn divide_with_one_space(s: &str) -> String {
+    let mut s = s.trim().split_whitespace();
+    let mut ret = String::new();
+    while let Some(v) = s.next() {
+        ret += v;
+        ret += " ";
+    }
+    ret.pop(); // Returns None if empty
+    ret
+}
 fn iostat_to_print() -> std::io::Result<String> {
     let cmd = "df replay_data | tail -n1 | awk '{print $1}' | sed 's,/dev/,,g' | sed 's,[1-9]*$,,g'";
     let output = Command::new("bash")
@@ -336,21 +356,14 @@ fn iostat_to_print() -> std::io::Result<String> {
         .arg(cmd)
         .output()?;
     let dev_name = String::from_utf8(output.stdout).unwrap();
-    let mut cmd = "iostat | grep ".to_string();
+    let mut cmd = "iostat 1 2 | grep ".to_string();
     cmd += &dev_name;
+    cmd += " | tail -n 1";
     let output = Command::new("bash")
         .arg("-c")
         .arg(cmd)
         .output()?;
-    let output = String::from_utf8(output.stdout).unwrap();
-    let mut s = output.trim().split_whitespace();
-    let mut ret = String::new();
-    while let Some(v) = s.next() {
-        ret += v;
-        ret += " ";
-    }
-    ret.pop(); // Returns None if empty
-    Ok(ret)
+    Ok(divide_with_one_space(String::from_utf8(output.stdout).unwrap().trim()))
 }
 fn time_to_print() -> std::io::Result<String> {
     let mut cmd = "cat /proc/".to_string();
@@ -377,7 +390,8 @@ fn cpu_mem() -> std::io::Result<String> {
 fn print_perf_info_once(
     writer: &mut MutexGuard<BufWriter<File>>,
     perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
-    start_time: &Instant
+    start_time: &Instant,
+    iostat_out: String,
 ) -> std::io::Result<()> {
     let perf_exec_info = perf_exec_info.lock();
     print_perf_item(writer, &format!("{} ", start_time.elapsed().as_millis()));
@@ -386,18 +400,18 @@ fn print_perf_info_once(
         writer, 
         &format!("{} ", perf_exec_info.transaction_executed_total)
     );
-    print_perf_item(writer, &(iostat_to_print()? + " "));
+    print_perf_item(writer, &(iostat_out + " "));
     print_perf_item(writer, &(time_to_print()? + " "));
     print_perf_item(writer, &cpu_mem()?);
     print_perf_item(writer, "\n");
     Ok(())
 }
-async fn print_perf_info(
+fn print_perf_info(
+    cancelled: Arc<AtomicBool>,
     perf_log_writer: Arc<Mutex<BufWriter<File>>>,
-    perf_exec_info: Arc<Mutex<PerfExecInfo>>
+    perf_exec_info: Arc<Mutex<PerfExecInfo>>,
 ) {
     let start_time = Instant::now();
-    let mut interval = time::interval(time::Duration::from_secs(1));
     print_perf_item(
         &mut perf_log_writer.lock(),
         "Time(ms) Epoch tx-exe device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
@@ -405,10 +419,25 @@ async fn print_perf_info(
             %cpu %mem\n",
     );
     loop {
-        interval.tick().await;
-        let mut  writer = perf_log_writer.lock();
-        if let Err(err) = print_perf_info_once(&mut writer, &perf_exec_info, &start_time) {
-            print_perf_item(&mut writer, &err.to_string());
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        let iostat_out = iostat_to_print();
+        let mut writer = perf_log_writer.lock();
+        match iostat_out {
+            Ok(iostat_out) => {
+                if let Err(err) = print_perf_info_once(
+                    &mut writer,
+                    &perf_exec_info,
+                    &start_time,
+                    iostat_out,
+                ) {
+                    print_perf_item(&mut writer, &err.to_string());
+                }
+            }
+            Err(err) => {
+                print_perf_item(&mut writer, &err.to_string());
+            }
         }
     }
 }
