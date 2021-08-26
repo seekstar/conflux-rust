@@ -221,7 +221,7 @@ fn main() {
 
     let perf_exec_info = Arc::new(Mutex::new(PerfExecInfo {
         transaction_executed_total: 0,
-        height: 1,
+        height,
     }));
     let perf_info_printer_canceller = Arc::new(AtomicBool::new(false));
     let perf_info_printer_canceller_cloned = perf_info_printer_canceller.clone();
