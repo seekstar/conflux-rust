@@ -372,7 +372,7 @@ fn iostat_to_print() -> std::io::Result<String> {
         .output()?;
     let dev_name = String::from_utf8(output.stdout).unwrap();
     let mut cmd = "iostat 1 2 | grep ".to_string();
-    cmd += &dev_name;
+    cmd += dev_name.trim();
     cmd += " | tail -n 1";
     let output = Command::new("bash")
         .arg("-c")
