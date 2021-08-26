@@ -9,7 +9,7 @@ use std::{
     },
     process::{self, Command},
     str::FromStr,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
     time::{Instant, Duration},
 };
 
@@ -18,6 +18,7 @@ use parking_lot::{Mutex, MutexGuard};
 use clap::{App, Arg};
 use rustc_hex::FromHex;
 use serde::Deserialize;
+use ctrlc::CtrlC;
 
 use cfx_types::{H256, U256, Address, address_util::AddressUtil};
 use primitives::{
@@ -186,9 +187,12 @@ fn main() {
     let mut last_committed_height = height;
     height += 1;
 
-    let mut epoch_to_execute = arg_matches
-        .value_of("epoch-to-execute")
-        .map(|v| v.parse::<u64>().unwrap());
+    let epoch_to_execute = Arc::new(AtomicU64::new(
+        match arg_matches.value_of("epoch-to-execute") {
+            Some(s) => s.parse().unwrap(),
+            None => u64::MAX,
+        }
+    ));
 
     let mut not_executed_drop_cnt = 0;
     let mut not_executed_to_reconsider_packing_cnt = 0;
@@ -214,16 +218,27 @@ fn main() {
         )
     });
 
+    let epoch_to_execute_cloned = epoch_to_execute.clone();
+    CtrlC::set_handler(move || {
+        let v = epoch_to_execute_cloned.as_ref();
+        v.store(0, Ordering::Relaxed);
+    });
     let mut line = String::new();
     while let Ok(_) = trace_reader.read_line(&mut line) {
         if line.len() == 0 {
             break;
         }
-        if let Some(v) = epoch_to_execute.as_mut() {
-            if *v == 0 {
-                break;
-            }
-            *v -= 1;
+        if let Err(0) = epoch_to_execute
+            .as_ref()
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                if x == 0 || x == u64::MAX {
+                    None
+                } else {
+                    Some(x - 1)
+                }
+            })
+        {
+            break;
         }
         let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
         for block_trace in epoch_trace.block_traces {
