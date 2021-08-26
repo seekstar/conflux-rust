@@ -150,7 +150,7 @@ fn main() {
     let trace_path = format!("{}/trace.txt", dir);
     let address_path = format!("{}/address.txt", dir);
     let trace_file = File::open(trace_path).unwrap();
-    let mut trace_reader = BufReader::new(trace_file);
+    let trace_reader = BufReader::new(trace_file);
     let perf_log_file = File::create(perf_log_path).unwrap();
     let perf_log_writer = Arc::new(Mutex::new(BufWriter::new(perf_log_file)));
 
@@ -202,6 +202,23 @@ fn main() {
     const DELETE_COMMITMENT_DELAY: usize = 100000;
     let mut prev_epoches = VecDeque::with_capacity(DELETE_COMMITMENT_DELAY);
 
+    let mut trace_lines = trace_reader.lines().peekable();
+    if let Some(Ok(line)) = trace_lines.peek() {
+        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
+        let mut h = epoch_trace.block_traces.last().unwrap().env.epoch_height;
+        if h > height {
+            eprintln!("Incomplete trace: Trace of epoch {} not found", height);
+            return;
+        }
+        if h < height {
+            println!("Skipping {} epoches in trace", height - h);
+            while h < height {
+                trace_lines.next();
+                h += 1;
+            }
+        }
+    }
+
     let perf_exec_info = Arc::new(Mutex::new(PerfExecInfo {
         transaction_executed_total: 0,
         height: 1,
@@ -223,8 +240,8 @@ fn main() {
         let v = epoch_to_execute_cloned.as_ref();
         v.store(0, Ordering::Relaxed);
     });
-    let mut line = String::new();
-    while let Ok(_) = trace_reader.read_line(&mut line) {
+    for line in trace_lines {
+        let line = line.unwrap();
         if line.len() == 0 {
             break;
         }
@@ -309,7 +326,6 @@ fn main() {
         // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
         //     return;
         // }
-        line.clear();
         if height % 2000 == 0 {
             let keep = 2000 * 50;
             if height > keep {
@@ -345,9 +361,7 @@ fn main() {
         epoch_hash = H256::random();
         commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
     }
-    if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        return;
-    }
+    check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses);
 }
 
 fn print_perf_item(writer: &mut MutexGuard<BufWriter<File>>, item: &str) {
