@@ -100,7 +100,8 @@ struct EpochTrace {
 
 struct PerfExecInfo {
     transaction_executed_total: usize,
-    height: u64,
+    old_height: u64,
+    new_height: u64,
 }
 
 fn main() {
@@ -119,8 +120,7 @@ fn main() {
                 .long("commit-interval")
                 .value_name("commit-interval")
                 .help("Commit every <commit-interval> transactions")
-                .takes_value(true)
-                .default_value("100"),
+                .takes_value(true),
         ).arg(
             Arg::with_name("perf-log")
                 .long("perf-log")
@@ -144,8 +144,9 @@ fn main() {
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
-    let commit_interval: usize =
-        arg_matches.value_of("commit-interval").unwrap().parse().unwrap();
+    let commit_interval = arg_matches
+        .value_of("commit-interval")
+        .map(|x| x.parse::<usize>().unwrap());
     let perf_log_path = arg_matches.value_of("perf-log").unwrap();
     let trace_path = format!("{}/trace.txt", dir);
     let address_path = format!("{}/address.txt", dir);
@@ -186,6 +187,7 @@ fn main() {
         };
     let mut last_committed_height = height;
     height += 1;
+    let mut new_height = height;
 
     let epoch_to_execute = Arc::new(AtomicU64::new(
         match arg_matches.value_of("epoch-to-execute") {
@@ -221,7 +223,8 @@ fn main() {
 
     let perf_exec_info = Arc::new(Mutex::new(PerfExecInfo {
         transaction_executed_total: 0,
-        height,
+        old_height: height,
+        new_height,
     }));
     let perf_info_printer_canceller = Arc::new(AtomicBool::new(false));
     let perf_info_printer_canceller_cloned = perf_info_printer_canceller.clone();
@@ -234,6 +237,39 @@ fn main() {
             perf_exec_info_cloned,
         )
     });
+
+    fn handle_epoch(
+        state: &mut State,
+        data_man_replay: &BlockDataManager,
+        epoch_hash: &mut H256,
+        commit_time: &mut Duration,
+        height: u64,
+        new_height: &mut u64,
+        last_committed_height: &mut u64,
+        prev_epoches: &mut VecDeque<H256>,
+        perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
+    ) {
+        *epoch_hash = H256::random();
+        commit_state(state, data_man_replay, epoch_hash, commit_time);
+        *state = next_state(data_man_replay, epoch_hash, *new_height);
+        if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
+            data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
+        }
+        prev_epoches.push_back(*epoch_hash);
+        data_man_replay.insert_executed_epoch_set_hashes_to_db(*new_height, &vec![*epoch_hash]);
+        *last_committed_height = height;
+        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
+        //     return;
+        // }
+        if *new_height % 2000 == 0 {
+            let keep = 2000 * 50;
+            if *new_height > keep {
+                cleanup_snapshots(data_man_replay, *new_height - keep);
+            }
+        }
+        *new_height += 1;
+        perf_exec_info.lock().new_height += 1;
+    }
 
     let epoch_to_execute_cloned = epoch_to_execute.clone();
     CtrlC::set_handler(move || {
@@ -291,10 +327,23 @@ fn main() {
                         finished_cnt += 1;
                     }
                 }
-                transaction_executed += 1;
                 perf_exec_info.lock().transaction_executed_total += 1;
-                if transaction_executed == commit_interval {
-                    transaction_executed = 0;
+                if let Some(commit_interval) = commit_interval {
+                    transaction_executed += 1;
+                    if transaction_executed == commit_interval {
+                        transaction_executed = 0;
+                        handle_epoch(
+                            &mut state,
+                            &data_man_replay,
+                            &mut epoch_hash,
+                            &mut commit_time,
+                            height,
+                            &mut new_height,
+                            &mut last_committed_height,
+                            &mut prev_epoches,
+                            &perf_exec_info,
+                        );
+                    }
                 }
             }
         }
@@ -314,39 +363,36 @@ fn main() {
                 epoch_trace.burnt_fee - epoch_trace.new_mint
             );
         }
-        epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
-        state = next_state(&data_man_replay, &epoch_hash, height);
-        if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
-            data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
-        }
-        prev_epoches.push_back(epoch_hash);
-        data_man_replay.insert_executed_epoch_set_hashes_to_db(height, &vec![epoch_hash]);
-        last_committed_height = height;
-        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        //     return;
-        // }
-        if height % 2000 == 0 {
-            let keep = 2000 * 50;
-            if height > keep {
-                cleanup_snapshots(&data_man_replay, height - keep);
-            }
+        if commit_interval == None {
+            handle_epoch(
+                &mut state,
+                &data_man_replay,
+                &mut epoch_hash,
+                &mut commit_time,
+                height,
+                &mut new_height,
+                &mut last_committed_height,
+                &mut prev_epoches,
+                &perf_exec_info,
+            );
         }
         height += 1;
-        perf_exec_info.lock().height += 1;
+        perf_exec_info.lock().old_height += 1;
     }
     height -= 1;
-    perf_exec_info.lock().height -= 1;
+    perf_exec_info.lock().old_height -= 1;
 
     perf_info_printer_canceller.store(true, Ordering::Relaxed);
     perf_info_printer.join().unwrap();
 
-    println!("height: {}\n\
+    println!("old_height: {}\n\
+        new_height: {}\n\
         NotExecutedDrop: {}\n\
         NotExecutedToReconsiderPacking: {}\n\
         ExecutionErrorBumpNonce: {}\n\
         Finished: {}",
         height,
+        new_height,
         not_executed_drop_cnt,
         not_executed_to_reconsider_packing_cnt,
         execution_error_bump_nonce_cnt,
@@ -357,7 +403,7 @@ fn main() {
         transact_time.as_millis(),
         commit_time.as_millis());
 
-    if last_committed_height < height {
+    if last_committed_height < height || transaction_executed > 0 {
         epoch_hash = H256::random();
         commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
     }
@@ -424,7 +470,8 @@ fn print_perf_info_once(
 ) -> std::io::Result<()> {
     let perf_exec_info = perf_exec_info.lock();
     print_perf_item(writer, &format!("{} ", start_time.elapsed().as_millis()));
-    print_perf_item(writer, &format!("{} ", perf_exec_info.height));
+    print_perf_item(writer, &format!("{} ", perf_exec_info.old_height));
+    print_perf_item(writer, &format!("{} ", perf_exec_info.new_height));
     print_perf_item(
         writer, 
         &format!("{} ", perf_exec_info.transaction_executed_total)
@@ -443,7 +490,8 @@ fn print_perf_info(
     let start_time = Instant::now();
     print_perf_item(
         &mut perf_log_writer.lock(),
-        "Time(ms) Epoch tx-exe device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
+        "Time(ms) old_height new_height tx-exe \
+            device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
             utime stime cutime cstime \
             %cpu %mem\n",
     );
