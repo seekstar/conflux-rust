@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{Write, BufWriter};
 
 use clap::{crate_version, load_yaml, App};
+use primitives::receipt::TRANSACTION_OUTCOME_EXCEPTION_WITHOUT_NONCE_BUMPING;
 use serde::Serialize;
 
 use primitives::{Action, SignedTransaction};
@@ -73,7 +74,17 @@ fn main() {
         let mut block_number = ctx.start_block_number;
         for hash in hashes {
             let block = data_man.block_by_hash(&hash, false).unwrap();
-            for transaction in &block.transactions {
+            let res = data_man
+                .block_execution_result_by_hash_from_db(&hash)
+                .unwrap();
+            let receipts = &res
+                .1
+                .block_receipts
+                .as_ref()
+                .receipts;
+            assert!(block.transactions.len() == receipts.len());
+            let mut transactions = Vec::new();
+            for (transaction, receipt) in block.transactions.iter().zip(receipts.iter()) {
                 match transaction.as_ref().transaction.transaction.unsigned.action {
                     Action::Create => {
                     }
@@ -81,9 +92,13 @@ fn main() {
                         addresses.insert(address);
                     }
                 }
+                cnts[receipt.outcome_status as usize] += 1;
+                if receipt.outcome_status != TRANSACTION_OUTCOME_EXCEPTION_WITHOUT_NONCE_BUMPING {
+                    transactions.push(transaction.clone());
+                }
             }
             block_trace.push(BlockTrace {
-                transactions: block.transactions.clone(),
+                transactions,
                 env: Env {
                     number: block_number,
                     author: block.block_header.author().clone(),
@@ -106,10 +121,6 @@ fn main() {
             let author = block.block_header.author();
             rewards.push((author.clone(), reward));
             addresses.insert(author.clone());
-            let res = data_man.block_execution_result_by_hash_from_db(&hash).unwrap();
-            for receipt in &res.1.block_receipts.as_ref().receipts {
-                cnts[receipt.outcome_status as usize] += 1;
-            }
             last_block_hash = hash;
             block_number += 1;
         }
