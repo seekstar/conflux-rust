@@ -1,69 +1,48 @@
 use std::{
     fs::File,
-    io::{
-        BufReader,
-        BufRead,
-    },
-    sync::{Arc},
+    io::{BufRead, BufReader},
     str::FromStr,
+    sync::Arc,
 };
 
-use threadpool::ThreadPool;
-use parking_lot::Mutex;
 use clap::{App, Arg};
+use parking_lot::Mutex;
 use rustc_hex::FromHex;
+use threadpool::ThreadPool;
 
-use cfx_types::{H256, U256, Address, address_util::AddressUtil};
-use primitives::{
-    Transaction,
-    Action,
-    Block,
-    BlockReceipts,
-    BlockHeaderBuilder,
-};
-use cfxcore::{
-    state::State,
-    spec::genesis::{
-        initialize_internal_contract_accounts,
-        GENESIS_ACCOUNT_ADDRESS_STR,
-        GENESIS_TRANSACTION_DATA_STR,
-        GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_CREATE_FUND_POOL,
-        execute_genesis_transaction,
+use cfx_parameters::{
+    consensus::{GENESIS_GAS_LIMIT, ONE_CFX_IN_DRIP},
+    consensus_internal::{
+        GENESIS_TOKEN_COUNT_IN_CFX, TWO_YEAR_UNLOCK_TOKEN_COUNT_IN_CFX,
     },
-    WORKER_COMPUTATION_PARALLELISM,
-    vm_factory::VmFactory,
-    machine::{new_machine_with_builtin, Machine},
-    pow::PowComputer,
-    BlockDataManager,
-    executive::contract_address,
-    vm::CreateContractAddress,
-    verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
-    state_trait::StateOpsTrait,
+    state_trait::{StateOpsTrait, StateTrait},
     CleanupMode,
-    state_trait::StateTrait,
 };
-use cfx_statedb::{
-    StateDb,
-    StateDbGetOriginalMethods,
-};
-use cfx_storage::{
-    StorageManager,
-    StorageManagerTrait,
-};
-use cfx_parameters::{
-    consensus::{
-        ONE_CFX_IN_DRIP,
-        GENESIS_GAS_LIMIT,
+use cfx_statedb::{StateDb, StateDbGetOriginalMethods};
+use cfx_storage::{StorageManager, StorageManagerTrait};
+use cfx_types::{address_util::AddressUtil, Address, H256, U256};
+use cfxcore::{
+    executive::contract_address,
+    machine::{new_machine_with_builtin, Machine},
+    pow::PowComputer,
+    spec::genesis::{
+        execute_genesis_transaction, initialize_internal_contract_accounts,
+        GENESIS_ACCOUNT_ADDRESS_STR, GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
+        GENESIS_TRANSACTION_CREATE_FUND_POOL,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_DATA_STR,
     },
-    consensus_internal::{
-        GENESIS_TOKEN_COUNT_IN_CFX,
-        TWO_YEAR_UNLOCK_TOKEN_COUNT_IN_CFX,
-    },
+    state::State,
+    verification::{compute_receipts_root, compute_transaction_root},
+    vm::CreateContractAddress,
+    vm_factory::VmFactory,
+    BlockDataManager, WORKER_COMPUTATION_PARALLELISM,
+};
+use primitives::{
+    Action, Block, BlockHeaderBuilder, BlockReceipts, Transaction,
 };
 
 use client::configuration::Configuration;
@@ -80,17 +59,23 @@ fn main() {
                 .help("The directory which stores trace.txt and mined.txt")
                 .takes_value(true)
                 .default_value("."),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("epoch-number")
                 .short("n")
                 .long("epoch-number")
                 .value_name("epoch-number")
                 .takes_value(true),
-        ).get_matches();
+        )
+        .get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
-    let height = arg_matches.value_of("epoch-number").unwrap().parse().unwrap();
+    let height = arg_matches
+        .value_of("epoch-number")
+        .unwrap()
+        .parse()
+        .unwrap();
     let address_path = format!("{}/address.txt", dir);
     let addresses = read_addresses(&address_path);
     let (data_man_ori, _, _, _) = open_db(&conf);
@@ -99,9 +84,9 @@ fn main() {
     check_state(&data_man_replay, &data_man_ori, height, &addresses);
 }
 
-fn open_db(conf: &Configuration)
-    -> (BlockDataManager, State, Block, Arc<Machine>)
-{
+fn open_db(
+    conf: &Configuration,
+) -> (BlockDataManager, State, Block, Arc<Machine>) {
     let storage_manager = Arc::new(
         StorageManager::new(conf.storage_config())
             .expect("Failed to initialize storage."),
@@ -123,7 +108,8 @@ fn open_db(conf: &Configuration)
     )));
     let (db_path, db_config) = conf.db_config();
     let ledger_db = db::open_database(db_path.to_str().unwrap(), &db_config)
-        .map_err(|e| format!("Failed to open database {:?}", e)).unwrap();
+        .map_err(|e| format!("Failed to open database {:?}", e))
+        .unwrap();
     let pow_config = conf.pow_config();
     let pow = Arc::new(PowComputer::new(pow_config.use_octopus()));
 
@@ -140,36 +126,39 @@ fn open_db(conf: &Configuration)
 }
 
 fn get_state_no_commit_by_epoch_hash(
-    data_man: &BlockDataManager,
-    epoch_hash: &H256
-) -> State
-{
+    data_man: &BlockDataManager, epoch_hash: &H256,
+) -> State {
     State::new(StateDb::new(
         data_man
-        .storage_manager
-        .get_state_no_commit(
-            data_man.get_state_readonly_index(epoch_hash).unwrap(),
-            false
-        ).unwrap().unwrap()
-    )).unwrap()
+            .storage_manager
+            .get_state_no_commit(
+                data_man.get_state_readonly_index(epoch_hash).unwrap(),
+                false,
+            )
+            .unwrap()
+            .unwrap(),
+    ))
+    .unwrap()
 }
 
 fn check_state(
-    data_man_replay: &BlockDataManager,
-    data_man_ori: &BlockDataManager,
-    epoch_height: u64,
-    addresses: &Vec<Address>
+    data_man_replay: &BlockDataManager, data_man_ori: &BlockDataManager,
+    epoch_height: u64, addresses: &Vec<Address>,
 ) -> bool
 {
-    let epoch_hashes_ori = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_hashes_ori = data_man_ori
+        .executed_epoch_set_hashes_from_db(epoch_height)
+        .unwrap();
     let epoch_id_ori = epoch_hashes_ori.last().unwrap();
-    let state_ori = get_state_no_commit_by_epoch_hash(
-        data_man_ori, &epoch_id_ori);
+    let state_ori =
+        get_state_no_commit_by_epoch_hash(data_man_ori, &epoch_id_ori);
 
-    let epoch_hashes_replay = data_man_replay.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let epoch_hashes_replay = data_man_replay
+        .executed_epoch_set_hashes_from_db(epoch_height)
+        .unwrap();
     let epoch_id_replay = epoch_hashes_replay.last().unwrap();
-    let state_replay = get_state_no_commit_by_epoch_hash(
-        data_man_replay, epoch_id_replay);
+    let state_replay =
+        get_state_no_commit_by_epoch_hash(data_man_replay, epoch_id_replay);
 
     let mut wrong = false;
     for address in addresses {
@@ -184,8 +173,10 @@ fn check_state(
         }
 
         // state must have been committed
-        let ori_storage_root = state_ori.db.get_original_storage_root(address).unwrap();
-        let cur_storage_root = state_replay.db.get_original_storage_root(address).unwrap();
+        let ori_storage_root =
+            state_ori.db.get_original_storage_root(address).unwrap();
+        let cur_storage_root =
+            state_replay.db.get_original_storage_root(address).unwrap();
         if ori_storage_root != cur_storage_root {
             println!("Error: epoch_height {}, address {:x}: ori_storage_root = {:?}, cur_storage_root = {:?}",
                 epoch_height, address, ori_storage_root, cur_storage_root);
@@ -198,8 +189,7 @@ fn check_state(
 }
 
 fn genesis_state(
-    storage_manager: &Arc<StorageManager>,
-    test_net_version: Address,
+    storage_manager: &Arc<StorageManager>, test_net_version: Address,
     initial_difficulty: U256, machine: Arc<Machine>, need_to_execute: bool,
     genesis_chain_id: Option<u32>,
 ) -> (Block, State)
@@ -420,9 +410,7 @@ fn genesis_state(
         .clean_account(&genesis_account_address)
         .expect("Clean account failed");
 
-    let state_root = state
-        .compute_state_root(None)
-        .unwrap();
+    let state_root = state.compute_state_root(None).unwrap();
     let receipt_root = compute_receipts_root(&vec![Arc::new(BlockReceipts {
         receipts: vec![],
         block_number: 0,

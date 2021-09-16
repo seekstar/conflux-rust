@@ -4,9 +4,7 @@
 
 use crate::{
     block_data_manager::{
-        BlockDataManager,
-        BlockRewardResult,
-        EpochRewardResult
+        BlockDataManager, BlockRewardResult, EpochRewardResult,
     },
     consensus::{
         consensus_inner::{
@@ -1548,12 +1546,9 @@ impl ConsensusExecutionHandler {
             debug_assert!(remainder.is_zero());
         }
         if on_local_pivot {
-            self.data_man
-                .db_manager
-                .insert_epoch_reward_result_to_db
-            (
+            self.data_man.db_manager.insert_epoch_reward_result_to_db(
                 epoch_later,
-                &EpochRewardResult{burnt_fee},
+                &EpochRewardResult { burnt_fee },
             )
         }
 

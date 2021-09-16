@@ -1,9 +1,9 @@
 use crate::{
     block_data_manager::{
         db_decode_list, db_encode_list, BlamedHeaderVerifiedRoots,
-        BlockExecutionResultWithEpoch, BlockRewardResult, EpochRewardResult,
-        BlockTracesWithEpoch, CheckpointHashes, DataVersionTuple,
-        EpochExecutionContext, LocalBlockInfo,
+        BlockExecutionResultWithEpoch, BlockRewardResult, BlockTracesWithEpoch,
+        CheckpointHashes, DataVersionTuple, EpochExecutionContext,
+        EpochRewardResult, LocalBlockInfo,
     },
     db::{
         COL_BLAMED_HEADER_VERIFIED_ROOTS, COL_BLOCKS, COL_BLOCK_TRACES,
