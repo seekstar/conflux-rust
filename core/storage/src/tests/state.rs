@@ -500,9 +500,7 @@ fn test_set_delete_all() {
         let key_prefix = &key[0..(2 + rng.gen::<usize>() % 2)];
 
         let value = state
-            .delete_all(StorageKey::AccountKey(
-                key_prefix,
-            ))
+            .delete_all(StorageKey::AccountKey(key_prefix))
             .expect("Failed to delete key.");
         if value.is_none() {
             continue;

@@ -8,7 +8,14 @@ use crate::{
     test_helpers::get_state_for_genesis_write, vm::Spec,
 };
 use cfx_parameters::{consensus::ONE_CFX_IN_DRIP, staking::*};
-use cfx_state::{StateTrait, state_trait::{CheckpointTxDeltaTrait, StateOpsTrait, StateOpsTxTrait, StateTxDeltaTrait}, substate_trait::SubstateMngTrait};
+use cfx_state::{
+    state_trait::{
+        CheckpointTxDeltaTrait, StateOpsTrait, StateOpsTxTrait,
+        StateTxDeltaTrait,
+    },
+    substate_trait::SubstateMngTrait,
+    StateTrait,
+};
 use cfx_statedb::StateDb;
 use cfx_storage::{
     tests::new_state_manager_for_unit_test, StateIndex, StorageManager,
@@ -819,7 +826,8 @@ fn kill_account_with_checkpoints() {
         .set_storage_layout(&a, StorageLayout::Regular(0))
         .unwrap();
     // We don't charge the collateral in this test.
-    state_0.io
+    state_0
+        .io
         .require_exists(&mut state_0.info, &a, /* require_code = */ false)
         .unwrap()
         .commit_ownership_change(&state_0.io.db, &mut Substate::new())
@@ -877,7 +885,8 @@ fn check_result_of_simple_payment_to_killed_account() {
     let storage_manager = new_state_manager_for_unit_test();
     let mut state_0 = get_state_for_genesis_write(&storage_manager);
     let sender_addr = DEV_GENESIS_KEY_PAIR.address();
-    state_0.io
+    state_0
+        .io
         .require_or_new_basic_account(
             &mut state_0.info,
             &sender_addr,
@@ -902,7 +911,8 @@ fn check_result_of_simple_payment_to_killed_account() {
         .set_storage_layout(&a, StorageLayout::Regular(0))
         .unwrap();
     // We don't charge the collateral in this test.
-    state_0.io
+    state_0
+        .io
         .require_exists(&mut state_0.info, &a, /* require_code = */ false)
         .unwrap()
         .commit_ownership_change(&state_0.io.db, &mut Substate::new())
@@ -1090,7 +1100,8 @@ fn create_contract_fail_previous_storage() {
     // parking_lot::lock_api::MappedRwLockWriteGuard must be used, so we drop()
     // it.
     drop(
-        state.io
+        state
+            .io
             .require_or_new_basic_account(
                 &mut state.info,
                 &a,

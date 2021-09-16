@@ -464,7 +464,9 @@ mod tests {
         vm::{Context as ContextTrait, Env, Spec},
     };
     use cfx_parameters::consensus::TRANSACTION_DEFAULT_EPOCH_BOUND;
-    use cfx_state::{state_trait::StateOpsTxTrait, substate_trait::SubstateMngTrait};
+    use cfx_state::{
+        state_trait::StateOpsTxTrait, substate_trait::SubstateMngTrait,
+    };
     use cfx_storage::{
         new_storage_manager_for_testing, tests::FakeStateManager,
     };

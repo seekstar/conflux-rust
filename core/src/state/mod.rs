@@ -1433,8 +1433,10 @@ impl<StateDbStorage: StorageStateTrait> StateGenericIO<StateDbStorage> {
     /// Get the value of storage at a specific checkpoint.
     #[cfg(test)]
     pub fn checkpoint_storage_at(
-        &self, info: &StateGenericInfo, start_checkpoint_index: usize, address: &Address, key: &Vec<u8>,
-    ) -> DbResult<Option<U256>> {
+        &self, info: &StateGenericInfo, start_checkpoint_index: usize,
+        address: &Address, key: &Vec<u8>,
+    ) -> DbResult<Option<U256>>
+    {
         #[derive(Debug)]
         enum ReturnKind {
             OriginalAt,
@@ -1722,15 +1724,20 @@ impl<StateDbStorage: StorageStateTrait> StateGeneric<StateDbStorage> {
     pub fn add_collateral_for_storage(
         &mut self, address: &Address, by: &U256,
     ) -> DbResult<()> {
-        self.io.add_collateral_for_storage(&mut self.info, address, by)
+        self.io
+            .add_collateral_for_storage(&mut self.info, address, by)
     }
 
     #[cfg(test)]
     pub fn sub_collateral_for_storage(
-        &mut self, address: &Address, by: &U256,
-        account_start_nonce: U256,
+        &mut self, address: &Address, by: &U256, account_start_nonce: U256,
     ) -> DbResult<()> {
-        self.io.sub_collateral_for_storage(&mut self.info, address, by, account_start_nonce)
+        self.io.sub_collateral_for_storage(
+            &mut self.info,
+            address,
+            by,
+            account_start_nonce,
+        )
     }
 
     #[allow(dead_code)]
@@ -1792,8 +1799,12 @@ impl<StateDbStorage: StorageStateTrait> StateGeneric<StateDbStorage> {
     pub fn checkpoint_storage_at(
         &self, start_checkpoint_index: usize, address: &Address, key: &Vec<u8>,
     ) -> DbResult<Option<U256>> {
-        self.io
-            .checkpoint_storage_at(&self.info, start_checkpoint_index, address, key)
+        self.io.checkpoint_storage_at(
+            &self.info,
+            start_checkpoint_index,
+            address,
+            key,
+        )
     }
 
     pub fn set_storage_layout(

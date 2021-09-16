@@ -1,80 +1,59 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{
-        BufReader,
-        BufRead,
-        BufWriter,
-        Write,
-    },
+    io::{BufRead, BufReader, BufWriter, Write},
     process::{self, Command},
     str::FromStr,
-    sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}},
-    time::{Instant, Duration},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 
-use threadpool::ThreadPool;
-use parking_lot::{Mutex, MutexGuard};
 use clap::{App, Arg};
+use ctrlc::CtrlC;
+use parking_lot::{Mutex, MutexGuard};
 use rustc_hex::FromHex;
 use serde::Deserialize;
-use ctrlc::CtrlC;
+use threadpool::ThreadPool;
 
-use cfx_types::{H256, U256, Address, address_util::AddressUtil};
-use primitives::{
-    SignedTransaction,
-    Transaction,
-    Action,
-    Block,
-    BlockReceipts,
-    BlockHeaderBuilder,
-};
-use cfxcore::{
-    state::State,
-    spec::genesis::{
-        initialize_internal_contract_accounts,
-        GENESIS_ACCOUNT_ADDRESS_STR,
-        GENESIS_TRANSACTION_DATA_STR,
-        GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_CREATE_FUND_POOL,
-        execute_genesis_transaction,
+use cfx_parameters::{
+    consensus::{GENESIS_GAS_LIMIT, ONE_CFX_IN_DRIP},
+    consensus_internal::{
+        GENESIS_TOKEN_COUNT_IN_CFX, TWO_YEAR_UNLOCK_TOKEN_COUNT_IN_CFX,
     },
-    WORKER_COMPUTATION_PARALLELISM,
-    vm_factory::VmFactory,
-    machine::{new_machine_with_builtin, Machine},
-    pow::PowComputer,
-    BlockDataManager,
-    executive::{
-        Executive,
-        contract_address,
-        TransactOptions,
-        ExecutionOutcome,
-    },
-    vm::{Env, CreateContractAddress},
-    verification::{compute_receipts_root, compute_transaction_root},
 };
 use cfx_state::{
-    state_trait::{StateOpsTxTrait, StateOpsTrait},
-    CleanupMode,
-    state_trait::StateTrait,
+    state_trait::{StateOpsTrait, StateOpsTxTrait},
+    CleanupMode, StateTrait,
 };
 use cfx_statedb::StateDb;
-use cfx_storage::{
-    StorageManager,
-    StorageManagerTrait,
-    StateIndex,
+use cfx_storage::{StateIndex, StorageManager, StorageManagerTrait};
+use cfx_types::{address_util::AddressUtil, Address, H256, U256};
+use cfxcore::{
+    executive::{
+        contract_address, ExecutionOutcome, Executive, TransactOptions,
+    },
+    machine::{new_machine_with_builtin, Machine},
+    pow::PowComputer,
+    spec::genesis::{
+        execute_genesis_transaction, initialize_internal_contract_accounts,
+        GENESIS_ACCOUNT_ADDRESS_STR, GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
+        GENESIS_TRANSACTION_CREATE_FUND_POOL,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_DATA_STR,
+    },
+    state::State,
+    verification::{compute_receipts_root, compute_transaction_root},
+    vm::{CreateContractAddress, Env},
+    vm_factory::VmFactory,
+    BlockDataManager, WORKER_COMPUTATION_PARALLELISM,
 };
-use cfx_parameters::{
-    consensus::{
-        ONE_CFX_IN_DRIP,
-        GENESIS_GAS_LIMIT,
-    },
-    consensus_internal::{
-        GENESIS_TOKEN_COUNT_IN_CFX,
-        TWO_YEAR_UNLOCK_TOKEN_COUNT_IN_CFX,
-    },
+use primitives::{
+    Action, Block, BlockHeaderBuilder, BlockReceipts, SignedTransaction,
+    Transaction,
 };
 
 use client::configuration::Configuration;
@@ -114,33 +93,40 @@ fn main() {
                 .help("The directory which stores trace.txt and mined.txt")
                 .takes_value(true)
                 .default_value("."),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("commit-interval")
                 .short("i")
                 .long("commit-interval")
                 .value_name("commit-interval")
                 .help("Commit every <commit-interval> transactions")
                 .takes_value(true),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("perf-log")
                 .long("perf-log")
                 .value_name("perf-log")
                 .help("Path to save perf log")
                 .takes_value(true)
                 .default_value("perf-log.txt"),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("start-epoch")
                 .long("start-epoch")
                 .value_name("start-epoch")
-                .help("The epoch number before the first epoch number to replay")
+                .help(
+                    "The epoch number before the first epoch number to replay",
+                )
                 .takes_value(true),
-        ).arg(
+        )
+        .arg(
             Arg::with_name("epoch-to-execute")
                 .long("epoch-to-execute")
                 .value_name("epoch-to-execute")
                 .help("The number of epochs to execute")
                 .takes_value(true),
-        ).get_matches();
+        )
+        .get_matches();
     let mut conf = Configuration::parse(&arg_matches).unwrap();
     conf.raw_conf.chain_id = Some(1029);
     let dir = arg_matches.value_of("data-dir").unwrap();
@@ -165,26 +151,27 @@ fn main() {
     let mut epoch_hash;
     let (data_man_ori, _, _, _) = open_db(&conf);
     conf.raw_conf.conflux_data_dir = "./replay_data".into();
-    let (data_man_replay, mut state, machine) =
-        if let Some(start_epoch) = arg_matches.value_of("start-epoch") {
-            let (data_man_replay, _, _, machine) = open_db(&conf);
-            height = start_epoch.parse().unwrap();
-            epoch_hash = data_man_replay
-                .executed_epoch_set_hashes_from_db(height)
-                .unwrap()
-                .last()
-                .unwrap()
-                .clone();
-            let state = next_state_from_db(&data_man_replay, &epoch_hash, height);
-            (data_man_replay, state, machine)
-        } else {
-            remove_dir_content(&conf.raw_conf.conflux_data_dir);
-            let (data_man_replay, _, genesis_block, machine) = open_db(&conf);
-            height = 0;
-            epoch_hash = genesis_block.hash();
-            let state = next_state(&data_man_replay, &epoch_hash, height);
-            (data_man_replay, state, machine)
-        };
+    let (data_man_replay, mut state, machine) = if let Some(start_epoch) =
+        arg_matches.value_of("start-epoch")
+    {
+        let (data_man_replay, _, _, machine) = open_db(&conf);
+        height = start_epoch.parse().unwrap();
+        epoch_hash = data_man_replay
+            .executed_epoch_set_hashes_from_db(height)
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let state = next_state_from_db(&data_man_replay, &epoch_hash, height);
+        (data_man_replay, state, machine)
+    } else {
+        remove_dir_content(&conf.raw_conf.conflux_data_dir);
+        let (data_man_replay, _, genesis_block, machine) = open_db(&conf);
+        height = 0;
+        epoch_hash = genesis_block.hash();
+        let state = next_state(&data_man_replay, &epoch_hash, height);
+        (data_man_replay, state, machine)
+    };
     let mut last_committed_height = height;
     height += 1;
     let mut new_height = height;
@@ -193,7 +180,7 @@ fn main() {
         match arg_matches.value_of("epoch-to-execute") {
             Some(s) => s.parse().unwrap(),
             None => u64::MAX,
-        }
+        },
     ));
 
     let mut not_executed_drop_cnt = 0;
@@ -227,7 +214,8 @@ fn main() {
         new_height,
     }));
     let perf_info_printer_canceller = Arc::new(AtomicBool::new(false));
-    let perf_info_printer_canceller_cloned = perf_info_printer_canceller.clone();
+    let perf_info_printer_canceller_cloned =
+        perf_info_printer_canceller.clone();
     let perf_log_writer_cloned = perf_log_writer.clone();
     let perf_exec_info_cloned = perf_exec_info.clone();
     let perf_info_printer = std::thread::spawn(move || {
@@ -239,27 +227,29 @@ fn main() {
     });
 
     fn handle_epoch(
-        state: &mut State,
-        data_man_replay: &BlockDataManager,
-        epoch_hash: &mut H256,
-        commit_time: &mut Duration,
-        height: u64,
-        new_height: &mut u64,
-        last_committed_height: &mut u64,
+        state: &mut State, data_man_replay: &BlockDataManager,
+        epoch_hash: &mut H256, commit_time: &mut Duration, height: u64,
+        new_height: &mut u64, last_committed_height: &mut u64,
         prev_epoches: &mut VecDeque<H256>,
         perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
-    ) {
+    )
+    {
         *epoch_hash = H256::random();
         commit_state(state, data_man_replay, epoch_hash, commit_time);
         *state = next_state(data_man_replay, epoch_hash, *new_height);
         if prev_epoches.len() == DELETE_COMMITMENT_DELAY {
-            data_man_replay.remove_epoch_execution_commitment(&prev_epoches.pop_front().unwrap());
+            data_man_replay.remove_epoch_execution_commitment(
+                &prev_epoches.pop_front().unwrap(),
+            );
         }
         prev_epoches.push_back(*epoch_hash);
-        data_man_replay.insert_executed_epoch_set_hashes_to_db(*new_height, &vec![*epoch_hash]);
+        data_man_replay.insert_executed_epoch_set_hashes_to_db(
+            *new_height,
+            &vec![*epoch_hash],
+        );
         *last_committed_height = height;
-        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses) {
-        //     return;
+        // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height,
+        // &addresses) {     return;
         // }
         if *new_height % 2000 == 0 {
             let keep = 2000 * 50;
@@ -281,16 +271,17 @@ fn main() {
         if line.len() == 0 {
             break;
         }
-        if let Err(0) = epoch_to_execute
-            .as_ref()
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+        if let Err(0) = epoch_to_execute.as_ref().fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |x| {
                 if x == 0 || x == u64::MAX {
                     None
                 } else {
                     Some(x - 1)
                 }
-            })
-        {
+            },
+        ) {
             break;
         }
         let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
@@ -299,7 +290,9 @@ fn main() {
             state.bump_block_number_accumulate_interest();
             initialize_internal_contract_accounts(
                 &mut state,
-                machine.internal_contracts().initialized_at(block_trace.env.number),
+                machine
+                    .internal_contracts()
+                    .initialized_at(block_trace.env.number),
                 spec.contract_start_nonce,
             );
             for transaction in block_trace.transactions {
@@ -309,11 +302,11 @@ fn main() {
                     &block_trace.env,
                     machine.as_ref(),
                     &spec,
-                ).transact(&transaction, TransactOptions::with_no_tracing());
+                )
+                .transact(&transaction, TransactOptions::with_no_tracing());
                 transact_time += now.elapsed();
                 let exe_res = exe_res.unwrap();
-                match exe_res
-                {
+                match exe_res {
                     ExecutionOutcome::NotExecutedDrop(_) => {
                         not_executed_drop_cnt += 1;
                     }
@@ -349,18 +342,25 @@ fn main() {
         }
         let mut merged_rewards = HashMap::new();
         for reward in epoch_trace.rewards {
-            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
+            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) +=
+                reward.1;
         }
         for (address, reward) in merged_rewards {
-            state.add_balance(
-                &address, &reward, CleanupMode::ForceCreate, U256::zero()
-            ).unwrap();
+            state
+                .add_balance(
+                    &address,
+                    &reward,
+                    CleanupMode::ForceCreate,
+                    U256::zero(),
+                )
+                .unwrap();
         }
         if epoch_trace.new_mint > epoch_trace.burnt_fee {
-            state.add_total_issued(epoch_trace.new_mint - epoch_trace.burnt_fee);
+            state
+                .add_total_issued(epoch_trace.new_mint - epoch_trace.burnt_fee);
         } else {
             state.subtract_total_issued(
-                epoch_trace.burnt_fee - epoch_trace.new_mint
+                epoch_trace.burnt_fee - epoch_trace.new_mint,
             );
         }
         if commit_interval == None {
@@ -385,12 +385,13 @@ fn main() {
     perf_info_printer_canceller.store(true, Ordering::Relaxed);
     perf_info_printer.join().unwrap();
 
-    println!("old_height: {}\n\
-        new_height: {}\n\
-        NotExecutedDrop: {}\n\
-        NotExecutedToReconsiderPacking: {}\n\
-        ExecutionErrorBumpNonce: {}\n\
-        Finished: {}",
+    println!(
+        "old_height: {}\n\
+         new_height: {}\n\
+         NotExecutedDrop: {}\n\
+         NotExecutedToReconsiderPacking: {}\n\
+         ExecutionErrorBumpNonce: {}\n\
+         Finished: {}",
         height,
         new_height,
         not_executed_drop_cnt,
@@ -398,16 +399,29 @@ fn main() {
         execution_error_bump_nonce_cnt,
         finished_cnt
     );
-    println!("transact_time: {} ms\n\
-        commit_time: {} ms",
+    println!(
+        "transact_time: {} ms\n\
+         commit_time: {} ms",
         transact_time.as_millis(),
-        commit_time.as_millis());
+        commit_time.as_millis()
+    );
 
     if last_committed_height < height || transaction_executed > 0 {
         epoch_hash = H256::random();
-        commit_state(&mut state, &data_man_replay, &epoch_hash, &mut commit_time);
+        commit_state(
+            &mut state,
+            &data_man_replay,
+            &epoch_hash,
+            &mut commit_time,
+        );
     }
-    check_state(&data_man_replay, &epoch_hash, &data_man_ori, height, &addresses);
+    check_state(
+        &data_man_replay,
+        &epoch_hash,
+        &data_man_ori,
+        height,
+        &addresses,
+    );
 }
 
 fn print_perf_item(writer: &mut MutexGuard<BufWriter<File>>, item: &str) {
@@ -426,28 +440,21 @@ fn divide_with_one_space(s: &str) -> String {
 }
 fn iostat_to_print() -> std::io::Result<String> {
     let cmd = "df replay_data | tail -n1 | awk '{print $1}' | sed 's,/dev/,,g' | sed 's,[1-9]*$,,g'";
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(cmd)
-        .output()?;
+    let output = Command::new("bash").arg("-c").arg(cmd).output()?;
     let dev_name = String::from_utf8(output.stdout).unwrap();
     let mut cmd = "iostat 1 2 | grep ".to_string();
     cmd += dev_name.trim();
     cmd += " | tail -n 1";
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(cmd)
-        .output()?;
-    Ok(divide_with_one_space(String::from_utf8(output.stdout).unwrap().trim()))
+    let output = Command::new("bash").arg("-c").arg(cmd).output()?;
+    Ok(divide_with_one_space(
+        String::from_utf8(output.stdout).unwrap().trim(),
+    ))
 }
 fn time_to_print() -> std::io::Result<String> {
     let mut cmd = "cat /proc/".to_string();
     cmd += &process::id().to_string();
     cmd += &"/stat | awk '{print $14,$15,$16,$17}'".to_string();
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(&cmd)
-        .output()?;
+    let output = Command::new("bash").arg("-c").arg(&cmd).output()?;
     Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
 }
 fn cpu_mem() -> std::io::Result<String> {
@@ -464,17 +471,17 @@ fn cpu_mem() -> std::io::Result<String> {
 }
 fn print_perf_info_once(
     writer: &mut MutexGuard<BufWriter<File>>,
-    perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
-    start_time: &Instant,
+    perf_exec_info: &Arc<Mutex<PerfExecInfo>>, start_time: &Instant,
     iostat_out: String,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+{
     let perf_exec_info = perf_exec_info.lock();
     print_perf_item(writer, &format!("{} ", start_time.elapsed().as_millis()));
     print_perf_item(writer, &format!("{} ", perf_exec_info.old_height));
     print_perf_item(writer, &format!("{} ", perf_exec_info.new_height));
     print_perf_item(
-        writer, 
-        &format!("{} ", perf_exec_info.transaction_executed_total)
+        writer,
+        &format!("{} ", perf_exec_info.transaction_executed_total),
     );
     print_perf_item(writer, &(iostat_out + " "));
     print_perf_item(writer, &(time_to_print()? + " "));
@@ -483,17 +490,17 @@ fn print_perf_info_once(
     Ok(())
 }
 fn print_perf_info(
-    cancelled: Arc<AtomicBool>,
-    perf_log_writer: Arc<Mutex<BufWriter<File>>>,
+    cancelled: Arc<AtomicBool>, perf_log_writer: Arc<Mutex<BufWriter<File>>>,
     perf_exec_info: Arc<Mutex<PerfExecInfo>>,
-) {
+)
+{
     let start_time = Instant::now();
     print_perf_item(
         &mut perf_log_writer.lock(),
         "Time(ms) old_height new_height tx-exe \
-            device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
-            utime stime cutime cstime \
-            %cpu %mem\n",
+         device iops kB_read/s kB_wrtn/s kB_read kB_wrtn \
+         utime stime cutime cstime \
+         %cpu %mem\n",
     );
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -519,9 +526,9 @@ fn print_perf_info(
     }
 }
 
-fn open_db(conf: &Configuration)
-    -> (BlockDataManager, State, Block, Arc<Machine>)
-{
+fn open_db(
+    conf: &Configuration,
+) -> (BlockDataManager, State, Block, Arc<Machine>) {
     let storage_manager = Arc::new(
         StorageManager::new(conf.storage_config())
             .expect("Failed to initialize storage."),
@@ -543,7 +550,8 @@ fn open_db(conf: &Configuration)
     )));
     let (db_path, db_config) = conf.db_config();
     let ledger_db = db::open_database(db_path.to_str().unwrap(), &db_config)
-        .map_err(|e| format!("Failed to open database {:?}", e)).unwrap();
+        .map_err(|e| format!("Failed to open database {:?}", e))
+        .unwrap();
     let pow_config = conf.pow_config();
     let pow = Arc::new(PowComputer::new(pow_config.use_octopus()));
 
@@ -560,34 +568,34 @@ fn open_db(conf: &Configuration)
 }
 
 fn get_state_no_commit_by_epoch_hash(
-    data_man: &BlockDataManager,
-    epoch_hash: &H256
-) -> State
-{
+    data_man: &BlockDataManager, epoch_hash: &H256,
+) -> State {
     State::new(StateDb::new(
         data_man
-        .storage_manager
-        .get_state_no_commit(
-            data_man.get_state_readonly_index(epoch_hash).unwrap(),
-            false
-        ).unwrap().unwrap()
-    )).unwrap()
+            .storage_manager
+            .get_state_no_commit(
+                data_man.get_state_readonly_index(epoch_hash).unwrap(),
+                false,
+            )
+            .unwrap()
+            .unwrap(),
+    ))
+    .unwrap()
 }
 
 fn check_state(
-    data_man_replay: &BlockDataManager,
-    epoch_hash_replay: &H256,
-    data_man_ori: &BlockDataManager,
-    epoch_height: u64,
-    addresses: &Vec<Address>
+    data_man_replay: &BlockDataManager, epoch_hash_replay: &H256,
+    data_man_ori: &BlockDataManager, epoch_height: u64,
+    addresses: &Vec<Address>,
 ) -> bool
 {
-    let state_replay = get_state_no_commit_by_epoch_hash(
-        data_man_replay, epoch_hash_replay);
-    let epoch_hashes = data_man_ori.executed_epoch_set_hashes_from_db(epoch_height).unwrap();
+    let state_replay =
+        get_state_no_commit_by_epoch_hash(data_man_replay, epoch_hash_replay);
+    let epoch_hashes = data_man_ori
+        .executed_epoch_set_hashes_from_db(epoch_height)
+        .unwrap();
     let epoch_id = epoch_hashes.last().unwrap();
-    let state_ori = get_state_no_commit_by_epoch_hash(
-        data_man_ori, &epoch_id);
+    let state_ori = get_state_no_commit_by_epoch_hash(data_man_ori, &epoch_id);
 
     let mut wrong = false;
     for address in addresses {
@@ -605,9 +613,7 @@ fn check_state(
 }
 
 fn commit_state(
-    state: &mut State,
-    data_man: &BlockDataManager,
-    epoch_hash: &H256,
+    state: &mut State, data_man: &BlockDataManager, epoch_hash: &H256,
     commit_time: &mut Duration,
 )
 {
@@ -623,49 +629,45 @@ fn commit_state(
 }
 
 fn next_state_from_db(
-    data_man: &BlockDataManager,
-    epoch_hash: &H256,
-    height: u64,
-) -> State
-{
+    data_man: &BlockDataManager, epoch_hash: &H256, height: u64,
+) -> State {
     State::new(StateDb::new(
         data_man
-        .storage_manager
-        .get_state_for_next_epoch(
-            StateIndex::new_for_next_epoch(
+            .storage_manager
+            .get_state_for_next_epoch(StateIndex::new_for_next_epoch(
                 epoch_hash,
                 &data_man
                     .load_epoch_execution_commitment_from_db(epoch_hash)
                     .unwrap()
                     .state_root_with_aux_info,
                 height,
-                data_man.get_snapshot_epoch_count()
-            )
-        ).unwrap().unwrap(),
-    )).unwrap()
+                data_man.get_snapshot_epoch_count(),
+            ))
+            .unwrap()
+            .unwrap(),
+    ))
+    .unwrap()
 }
 
 fn next_state(
-    data_man: &BlockDataManager,
-    epoch_hash: &H256,
-    height: u64,
-) -> State
-{
+    data_man: &BlockDataManager, epoch_hash: &H256, height: u64,
+) -> State {
     State::new(StateDb::new(
         data_man
-        .storage_manager
-        .get_state_for_next_epoch(
-            StateIndex::new_for_next_epoch(
+            .storage_manager
+            .get_state_for_next_epoch(StateIndex::new_for_next_epoch(
                 epoch_hash,
                 &data_man
                     .get_epoch_execution_commitment(epoch_hash)
                     .unwrap()
                     .state_root_with_aux_info,
                 height,
-                data_man.get_snapshot_epoch_count()
-            )
-        ).unwrap().unwrap(),
-    )).unwrap()
+                data_man.get_snapshot_epoch_count(),
+            ))
+            .unwrap()
+            .unwrap(),
+    ))
+    .unwrap()
 }
 
 fn cleanup_snapshots(data_man: &BlockDataManager, height_keep: u64) {
@@ -679,21 +681,21 @@ fn cleanup_snapshots(data_man: &BlockDataManager, height_keep: u64) {
             if snapshot_info.height < height_keep {
                 old_pivot_snapshot_infos_to_remove
                     .push(snapshot_epoch_id.clone());
-                old_pivot_snapshots_to_remove
-                    .push(snapshot_epoch_id.clone());
+                old_pivot_snapshots_to_remove.push(snapshot_epoch_id.clone());
             }
         }
     }
-    storage.remove_snapshots(
-        &old_pivot_snapshots_to_remove,
-        &Vec::new(),
-        &old_pivot_snapshot_infos_to_remove.drain(..).collect(),
-    ).unwrap();
+    storage
+        .remove_snapshots(
+            &old_pivot_snapshots_to_remove,
+            &Vec::new(),
+            &old_pivot_snapshot_infos_to_remove.drain(..).collect(),
+        )
+        .unwrap();
 }
 
 fn genesis_state(
-    storage_manager: &Arc<StorageManager>,
-    test_net_version: Address,
+    storage_manager: &Arc<StorageManager>, test_net_version: Address,
     initial_difficulty: U256, machine: Arc<Machine>, need_to_execute: bool,
     genesis_chain_id: Option<u32>,
 ) -> (Block, State)
@@ -914,9 +916,7 @@ fn genesis_state(
         .clean_account(&genesis_account_address)
         .expect("Clean account failed");
 
-    let state_root = state
-        .compute_state_root(None)
-        .unwrap();
+    let state_root = state.compute_state_root(None).unwrap();
     let receipt_root = compute_receipts_root(&vec![Arc::new(BlockReceipts {
         receipts: vec![],
         block_number: 0,

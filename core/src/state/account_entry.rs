@@ -950,7 +950,9 @@ mod tests {
 
         assert!(account.as_account().unwrap().is_default());
 
-        account.cache_staking_info(true, true, &state.io.db).unwrap();
+        account
+            .cache_staking_info(true, true, &state.io.db)
+            .unwrap();
         assert!(account.vote_stake_list().unwrap().is_default());
         assert!(account.deposit_list().unwrap().is_default());
     }
