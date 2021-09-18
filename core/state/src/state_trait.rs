@@ -7,6 +7,9 @@ pub trait StateOpsTxTrait {
     /// Calculate the secondary reward for the next block number.
     fn bump_block_number_accumulate_interest(&mut self) -> U256;
 
+    /// Maintain `total_issued_tokens`.
+    fn add_total_issued(&mut self, v: U256);
+
     /// Maintain `total_issued_tokens`. This is only used in the extremely
     /// unlikely case that there are a lot of partial invalid blocks.
     fn subtract_total_issued(&mut self, v: U256);
@@ -210,9 +213,6 @@ pub trait StateTxDeltaTrait {
 pub trait StateTxTrait: CheckpointTxTrait + StateTxDeltaTrait {}
 
 pub trait StateOpsTrait: StateOpsTxTrait {
-    /// Maintain `total_issued_tokens`.
-    fn add_total_issued(&mut self, v: U256);
-
     fn sponsor_info(&self, address: &Address) -> DbResult<Option<SponsorInfo>>;
 
     fn clean_account(&mut self, address: &Address) -> DbResult<()>;

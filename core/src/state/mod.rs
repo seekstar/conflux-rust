@@ -1831,6 +1831,10 @@ impl<StateDbStorage: StorageStateTrait> StateOpsTxTrait
         self.info.bump_block_number_accumulate_interest()
     }
 
+    fn add_total_issued(&mut self, v: U256) {
+        self.info.add_total_issued(v)
+    }
+
     fn subtract_total_issued(&mut self, v: U256) {
         self.info.subtract_total_issued(v)
     }
@@ -2203,8 +2207,6 @@ impl<StateDbStorage: StorageStateTrait> StateTxTrait
 impl<StateDbStorage: StorageStateTrait> StateOpsTrait
     for StateGeneric<StateDbStorage>
 {
-    fn add_total_issued(&mut self, v: U256) { self.info.add_total_issued(v) }
-
     fn sponsor_info(&self, address: &Address) -> DbResult<Option<SponsorInfo>> {
         self.io.sponsor_info(address)
     }

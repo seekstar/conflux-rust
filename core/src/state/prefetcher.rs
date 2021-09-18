@@ -73,6 +73,10 @@ impl<'a, StateDbStorage: StorageStateTrait> StateOpsTxTrait
         self.info.bump_block_number_accumulate_interest()
     }
 
+    fn add_total_issued(&mut self, v: U256) {
+        self.info.add_total_issued(v)
+    }
+
     fn subtract_total_issued(&mut self, v: U256) {
         self.info.subtract_total_issued(v)
     }

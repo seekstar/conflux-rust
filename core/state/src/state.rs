@@ -21,6 +21,17 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
         unimplemented!()
     }
 
+    fn add_total_issued(&mut self, v: U256) {
+        let new_total_issued = self.total_issued_tokens() + v;
+        self.set_storage(
+            &STORAGE_INTEREST_STAKING_CONTRACT_ADDRESS,
+            TOTAL_TOKENS_KEY.to_vec(),
+            new_total_issued,
+            *STORAGE_INTEREST_STAKING_CONTRACT_ADDRESS,
+        )
+        .unwrap();
+    }
+
     fn subtract_total_issued(&mut self, v: U256) {
         let new_total_issued = self.total_issued_tokens() - v;
         self.set_storage(
@@ -585,17 +596,6 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait> StateTrait
 impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     StateOpsTrait for State<StateDbStorage, Substate>
 {
-    fn add_total_issued(&mut self, v: U256) {
-        let new_total_issued = self.total_issued_tokens() + v;
-        self.set_storage(
-            &STORAGE_INTEREST_STAKING_CONTRACT_ADDRESS,
-            TOTAL_TOKENS_KEY.to_vec(),
-            new_total_issued,
-            *STORAGE_INTEREST_STAKING_CONTRACT_ADDRESS,
-        )
-        .unwrap();
-    }
-
     fn sponsor_info(&self, address: &Address) -> Result<Option<SponsorInfo>> {
         Ok(self
             .get_account(address)?

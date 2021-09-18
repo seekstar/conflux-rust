@@ -1,22 +1,25 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    fs::File,
-    io::{BufRead, BufReader, BufWriter, Write},
-    process::{self, Command},
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+    collections::{
+        HashMap,
+        VecDeque
     },
-    time::{Duration, Instant},
-};
+    fs::File,
+    io::{BufRead, BufReader, BufWriter, Lines, Write},
+    iter::Peekable, process::{self, Command}, str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    }, time::{Instant, Duration}};
 
+use cfx_types::{Address, H256, U256, address_util::AddressUtil};
+use primitives::{Action, Block, BlockHeaderBuilder, BlockReceipts, SignedTransaction, Transaction};
+use threadpool::ThreadPool;
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use clap::{App, Arg};
 use ctrlc::CtrlC;
-use parking_lot::{Mutex, MutexGuard};
 use rustc_hex::FromHex;
 use serde::Deserialize;
-use threadpool::ThreadPool;
 
 use cfx_parameters::{
     consensus::{GENESIS_GAS_LIMIT, ONE_CFX_IN_DRIP},
@@ -24,37 +27,23 @@ use cfx_parameters::{
         GENESIS_TOKEN_COUNT_IN_CFX, TWO_YEAR_UNLOCK_TOKEN_COUNT_IN_CFX,
     },
 };
+use cfxcore::{BlockDataManager, WORKER_COMPUTATION_PARALLELISM, executive::{ExecutionOutcome, ExecutiveGeneric, TransactOptions, contract_address}, machine::{new_machine_with_builtin, Machine}, pow::PowComputer, spec::genesis::{
+        initialize_internal_contract_accounts,
+        GENESIS_ACCOUNT_ADDRESS_STR,
+        GENESIS_TRANSACTION_DATA_STR,
+        GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
+        GENESIS_TRANSACTION_CREATE_FUND_POOL,
+        execute_genesis_transaction,
+    }, state::{State, prefetcher::{ExecutionStatePrefetcher, StateWithWaiters, prefetch_accounts_worker}}, verification::{compute_receipts_root, compute_transaction_root}, vm::{Env, CreateContractAddress}, vm_factory::VmFactory};
 use cfx_state::{
-    state_trait::{StateOpsTrait, StateOpsTxTrait},
-    CleanupMode, StateTrait,
+    state_trait::{StateOpsTxTrait, StateOpsTrait},
+    CleanupMode,
+    state_trait::StateTrait,
 };
 use cfx_statedb::StateDb;
-use cfx_storage::{StateIndex, StorageManager, StorageManagerTrait};
-use cfx_types::{address_util::AddressUtil, Address, H256, U256};
-use cfxcore::{
-    executive::{
-        contract_address, ExecutionOutcome, Executive, TransactOptions,
-    },
-    machine::{new_machine_with_builtin, Machine},
-    pow::PowComputer,
-    spec::genesis::{
-        execute_genesis_transaction, initialize_internal_contract_accounts,
-        GENESIS_ACCOUNT_ADDRESS_STR, GENESIS_TRANSACTION_CREATE_CREATE2FACTORY,
-        GENESIS_TRANSACTION_CREATE_FUND_POOL,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_FOUR_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_CREATE_GENESIS_TOKEN_MANAGER_TWO_YEAR_UNLOCK,
-        GENESIS_TRANSACTION_DATA_STR,
-    },
-    state::State,
-    verification::{compute_receipts_root, compute_transaction_root},
-    vm::{CreateContractAddress, Env},
-    vm_factory::VmFactory,
-    BlockDataManager, WORKER_COMPUTATION_PARALLELISM,
-};
-use primitives::{
-    Action, Block, BlockHeaderBuilder, BlockReceipts, SignedTransaction,
-    Transaction,
-};
+use cfx_storage::{StateIndex, StorageManager, StorageManagerTrait, defaults::DEFAULT_EXECUTION_PREFETCH_THREADS};
 
 use client::configuration::Configuration;
 
@@ -64,8 +53,8 @@ extern crate serde_json;
 
 #[derive(Deserialize)]
 struct BlockTrace {
-    transactions: Vec<SignedTransaction>,
-    env: Env,
+    transactions: Vec<Arc<SignedTransaction>>,
+    env: Arc<Env>,
 }
 #[allow(dead_code)]
 #[derive(Deserialize)]
@@ -75,6 +64,12 @@ struct EpochTrace {
     rewards: Vec<(Address, U256)>,
     new_mint: U256,
     burnt_fee: U256,
+}
+
+enum ExecItem {
+    Transaction(Arc<SignedTransaction>),
+    Block(Arc<Env>),
+    Epoch(Vec<(Address, U256)>, U256, U256), // rewards, new_mint, burnt_fee
 }
 
 struct PerfExecInfo {
@@ -143,7 +138,6 @@ fn main() {
 
     let addresses = read_addresses(&address_path);
 
-    let mut transaction_executed: usize = 0;
     let mut transact_time = Duration::from_secs(0);
     let mut commit_time = Duration::from_secs(0);
 
@@ -172,7 +166,6 @@ fn main() {
         let state = next_state(&data_man_replay, &epoch_hash, height);
         (data_man_replay, state, machine)
     };
-    let mut last_committed_height = height;
     height += 1;
     let mut new_height = height;
 
@@ -208,6 +201,25 @@ fn main() {
         }
     }
 
+    let prefetcher = Arc::new(
+        ExecutionStatePrefetcher::new(
+            DEFAULT_EXECUTION_PREFETCH_THREADS,
+        )
+        .expect(
+            // Do not accept error at starting up.
+            &concat!(file!(), ":", line!(), ":", column!()),
+        ),
+    );
+    let (exec_items_sender, exec_items_receiver) = mpsc::channel();
+    let epoch_to_execute_cloned = epoch_to_execute.clone();
+    let _trace_reader_thread = std::thread::spawn(move || {
+        read_trace(
+            trace_lines,
+            exec_items_sender,
+            epoch_to_execute_cloned,
+        )
+    });
+
     let perf_exec_info = Arc::new(Mutex::new(PerfExecInfo {
         transaction_executed_total: 0,
         old_height: height,
@@ -226,14 +238,148 @@ fn main() {
         )
     });
 
-    fn handle_epoch(
-        state: &mut State, data_man_replay: &BlockDataManager,
-        epoch_hash: &mut H256, commit_time: &mut Duration, height: u64,
-        new_height: &mut u64, last_committed_height: &mut u64,
+    let (mut spec, mut env) = {
+        let item = exec_items_receiver.recv().unwrap();
+        match item {
+            ExecItem::Block(env) => {
+                let spec = machine.spec(env.number);
+                state.bump_block_number_accumulate_interest();
+                initialize_internal_contract_accounts(
+                    &mut state,
+                    machine.internal_contracts().initialized_at(env.number),
+                    spec.contract_start_nonce,
+                );
+                (spec, env)
+            }
+            _ => {
+                panic!();
+            }
+        }
+    };
+    let mut handle_epoch = |
+        exec_items: Vec<ExecItem>,
+        state: &mut State,
+        data_man_replay: &BlockDataManager,
+        epoch_hash: &mut H256,
+        commit_time: &mut Duration,
+        height: &mut u64,
+        new_height: &mut u64,
         prev_epoches: &mut VecDeque<H256>,
         perf_exec_info: &Arc<Mutex<PerfExecInfo>>,
-    )
-    {
+    | {
+        let mut accounts = Vec::new();
+        for item in &exec_items {
+            if let ExecItem::Transaction(transaction) = &item {
+                accounts.push(&transaction.sender);
+                match transaction.action {
+                    Action::Call(ref address) => accounts.push(address),
+                    _ => {}
+                }
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let io = &state.io;
+        let info = &mut state.info;
+        prefetcher.pool.in_place_scope(|s| {
+            let num_accounts = accounts.len();
+            let max_workers = 4;
+            let mut thread_idx = 0;
+            let mut range_start = num_accounts * thread_idx / max_workers;
+            let mut range_end = num_accounts * (thread_idx + 1) / max_workers;
+            let mut address_waiters_map = HashMap::new();
+            let mut address_waiters_vec =
+                Vec::with_capacity(range_end - range_start);
+            for (i, addr) in accounts.iter().enumerate() {
+                if i == range_end {
+                    s.spawn(|_| {
+                        prefetch_accounts_worker(
+                            io,
+                            address_waiters_vec,
+                            &cancel,
+                        )
+                    });
+                    thread_idx += 1;
+                    range_start = num_accounts * thread_idx / max_workers;
+                    range_end = num_accounts * (thread_idx + 1) / max_workers;
+                    address_waiters_vec =
+                        Vec::with_capacity(range_end - range_start);
+                }
+                let waiter = Arc::new((Mutex::new(false), Condvar::new()));
+                address_waiters_map.insert(*addr, waiter.clone());
+                address_waiters_vec.push((*addr, waiter));
+            }
+            s.spawn(|_| {
+                prefetch_accounts_worker(io, address_waiters_vec, &cancel)
+            });
+            let mut state = StateWithWaiters {
+                io,
+                info,
+                address_waiters: address_waiters_map,
+            };
+            for item in &exec_items {
+                match item {
+                    ExecItem::Epoch(rewards, new_mint, burnt_fee) => {
+                        let mut merged_rewards = HashMap::new();
+                        for reward in rewards {
+                            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) += reward.1;
+                        }
+                        for (address, reward) in merged_rewards {
+                            state.add_balance(
+                                &address, &reward, CleanupMode::ForceCreate, U256::zero()
+                            ).unwrap();
+                        }
+                        if new_mint > burnt_fee {
+                            state.add_total_issued(new_mint - burnt_fee);
+                        } else {
+                            state.subtract_total_issued(
+                                burnt_fee - new_mint
+                            );
+                        }
+                        *height += 1;
+                        perf_exec_info.lock().old_height += 1;
+                    }
+                    ExecItem::Block(new_env) => {
+                        env = new_env.clone();
+                        spec = machine.spec(env.number);
+                        state.bump_block_number_accumulate_interest();
+                        initialize_internal_contract_accounts(
+                            &mut state,
+                            machine.internal_contracts().initialized_at(env.number),
+                            spec.contract_start_nonce,
+                        );
+                    }
+                    ExecItem::Transaction(transaction) => {
+                        let now = Instant::now();
+                        let exe_res = ExecutiveGeneric::new(
+                            &mut state,
+                            &env,
+                            machine.as_ref(),
+                            &spec,
+                        ).transact(&transaction, TransactOptions::with_no_tracing());
+                        transact_time += now.elapsed();
+                        let exe_res = exe_res.unwrap();
+                        match exe_res
+                        {
+                            ExecutionOutcome::NotExecutedDrop(_) => {
+                                not_executed_drop_cnt += 1;
+                            }
+                            ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
+                                not_executed_to_reconsider_packing_cnt += 1;
+                            }
+                            ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
+                                execution_error_bump_nonce_cnt += 1;
+                            }
+                            ExecutionOutcome::Finished(_) => {
+                                finished_cnt += 1;
+                            }
+                        }
+                        perf_exec_info.lock().transaction_executed_total += 1;
+                    }
+                }
+            }
+            cancel.store(true, Ordering::Relaxed);
+        });
+
         *epoch_hash = H256::random();
         commit_state(state, data_man_replay, epoch_hash, commit_time);
         *state = next_state(data_man_replay, epoch_hash, *new_height);
@@ -247,7 +393,6 @@ fn main() {
             *new_height,
             &vec![*epoch_hash],
         );
-        *last_committed_height = height;
         // if check_state(&data_man_replay, &epoch_hash, &data_man_ori, height,
         // &addresses) {     return;
         // }
@@ -259,125 +404,71 @@ fn main() {
         }
         *new_height += 1;
         perf_exec_info.lock().new_height += 1;
-    }
-
-    let epoch_to_execute_cloned = epoch_to_execute.clone();
+    };
     CtrlC::set_handler(move || {
-        let v = epoch_to_execute_cloned.as_ref();
+        let v = epoch_to_execute.as_ref();
         v.store(0, Ordering::Relaxed);
     });
-    for line in trace_lines {
-        let line = line.unwrap();
-        if line.len() == 0 {
-            break;
-        }
-        if let Err(0) = epoch_to_execute.as_ref().fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |x| {
-                if x == 0 || x == u64::MAX {
-                    None
-                } else {
-                    Some(x - 1)
-                }
-            },
-        ) {
-            break;
-        }
-        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
-        for block_trace in epoch_trace.block_traces {
-            let spec = machine.spec(block_trace.env.number);
-            state.bump_block_number_accumulate_interest();
-            initialize_internal_contract_accounts(
-                &mut state,
-                machine
-                    .internal_contracts()
-                    .initialized_at(block_trace.env.number),
-                spec.contract_start_nonce,
-            );
-            for transaction in block_trace.transactions {
-                let now = Instant::now();
-                let exe_res = Executive::new(
-                    &mut state,
-                    &block_trace.env,
-                    machine.as_ref(),
-                    &spec,
-                )
-                .transact(&transaction, TransactOptions::with_no_tracing());
-                transact_time += now.elapsed();
-                let exe_res = exe_res.unwrap();
-                match exe_res {
-                    ExecutionOutcome::NotExecutedDrop(_) => {
-                        not_executed_drop_cnt += 1;
-                    }
-                    ExecutionOutcome::NotExecutedToReconsiderPacking(_) => {
-                        not_executed_to_reconsider_packing_cnt += 1;
-                    }
-                    ExecutionOutcome::ExecutionErrorBumpNonce(_, _) => {
-                        execution_error_bump_nonce_cnt += 1;
-                    }
-                    ExecutionOutcome::Finished(_) => {
-                        finished_cnt += 1;
-                    }
-                }
-                perf_exec_info.lock().transaction_executed_total += 1;
-                if let Some(commit_interval) = commit_interval {
-                    transaction_executed += 1;
-                    if transaction_executed == commit_interval {
-                        transaction_executed = 0;
-                        handle_epoch(
-                            &mut state,
-                            &data_man_replay,
-                            &mut epoch_hash,
-                            &mut commit_time,
-                            height,
-                            &mut new_height,
-                            &mut last_committed_height,
-                            &mut prev_epoches,
-                            &perf_exec_info,
-                        );
-                    }
-                }
+    let mut exec_items = Vec::new();
+    if let Some(commit_interval) = commit_interval {
+        let mut transaction_num = 0;
+        while let Ok(item) = exec_items_receiver.recv() {
+            if let ExecItem::Transaction(_) = &item {
+                transaction_num += 1;
             }
-        }
-        let mut merged_rewards = HashMap::new();
-        for reward in epoch_trace.rewards {
-            *merged_rewards.entry(reward.0).or_insert(U256::from(0)) +=
-                reward.1;
-        }
-        for (address, reward) in merged_rewards {
-            state
-                .add_balance(
-                    &address,
-                    &reward,
-                    CleanupMode::ForceCreate,
-                    U256::zero(),
-                )
-                .unwrap();
-        }
-        if epoch_trace.new_mint > epoch_trace.burnt_fee {
-            state
-                .add_total_issued(epoch_trace.new_mint - epoch_trace.burnt_fee);
-        } else {
-            state.subtract_total_issued(
-                epoch_trace.burnt_fee - epoch_trace.new_mint,
-            );
-        }
-        if commit_interval == None {
+            exec_items.push(item);
+            if transaction_num != commit_interval {
+                continue;
+            }
             handle_epoch(
+                exec_items,
                 &mut state,
                 &data_man_replay,
                 &mut epoch_hash,
                 &mut commit_time,
-                height,
+                &mut height,
                 &mut new_height,
-                &mut last_committed_height,
+                &mut prev_epoches,
+                &perf_exec_info,
+            );
+            exec_items = Vec::new();
+            transaction_num = 0;
+        }
+        if !exec_items.is_empty() {
+            handle_epoch(
+                exec_items,
+                &mut state,
+                &data_man_replay,
+                &mut epoch_hash,
+                &mut commit_time,
+                &mut height,
+                &mut new_height,
                 &mut prev_epoches,
                 &perf_exec_info,
             );
         }
-        height += 1;
-        perf_exec_info.lock().old_height += 1;
+     } else {
+        while let Ok(item) = exec_items_receiver.recv() {
+            let is_epoch = match item {
+                ExecItem::Epoch(_, _, _) => true,
+                _ => false,
+            };
+            exec_items.push(item);
+            if is_epoch {
+                handle_epoch(
+                    exec_items,
+                    &mut state,
+                    &data_man_replay,
+                    &mut epoch_hash,
+                    &mut commit_time,
+                    &mut height,
+                    &mut new_height,
+                    &mut prev_epoches,
+                    &perf_exec_info,
+                );
+                exec_items = Vec::new();
+            }
+        }
     }
     height -= 1;
     perf_exec_info.lock().old_height -= 1;
@@ -406,15 +497,6 @@ fn main() {
         commit_time.as_millis()
     );
 
-    if last_committed_height < height || transaction_executed > 0 {
-        epoch_hash = H256::random();
-        commit_state(
-            &mut state,
-            &data_man_replay,
-            &epoch_hash,
-            &mut commit_time,
-        );
-    }
     check_state(
         &data_man_replay,
         &epoch_hash,
@@ -422,6 +504,43 @@ fn main() {
         height,
         &addresses,
     );
+}
+
+fn read_trace(
+    trace_lines: Peekable<Lines<BufReader<File>>>,
+    exec_items_sender: mpsc::Sender<ExecItem>,
+    epoch_to_execute: Arc<AtomicU64>,
+) {
+    for line in trace_lines {
+        let line = line.unwrap();
+        if line.len() == 0 {
+            break;
+        }
+        if let Err(0) = epoch_to_execute
+            .as_ref()
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+                if x == 0 || x == u64::MAX {
+                    None
+                } else {
+                    Some(x - 1)
+                }
+            })
+        {
+            break;
+        }
+        let epoch_trace = serde_json::from_str::<EpochTrace>(&line).unwrap();
+        for block_trace in epoch_trace.block_traces {
+            exec_items_sender.send(ExecItem::Block(block_trace.env)).unwrap();
+            for transaction in block_trace.transactions {
+                exec_items_sender.send(ExecItem::Transaction(transaction)).unwrap();
+            }
+        }
+        exec_items_sender.send(ExecItem::Epoch(
+            epoch_trace.rewards,
+            epoch_trace.new_mint,
+            epoch_trace.burnt_fee
+        )).unwrap();
+    }
 }
 
 fn print_perf_item(writer: &mut MutexGuard<BufWriter<File>>, item: &str) {
