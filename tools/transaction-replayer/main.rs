@@ -591,9 +591,15 @@ fn check_state(
 {
     let state_replay =
         get_state_no_commit_by_epoch_hash(data_man_replay, epoch_hash_replay);
-    let epoch_hashes = data_man_ori
+    let epoch_hashes = match data_man_ori
         .executed_epoch_set_hashes_from_db(epoch_height)
-        .unwrap();
+    {
+        Some(x) => x,
+        None => {
+            eprintln!("Fail to read epoch {} from data_man_ori", epoch_height);
+            return true;
+        }
+    };
     let epoch_id = epoch_hashes.last().unwrap();
     let state_ori = get_state_no_commit_by_epoch_hash(data_man_ori, &epoch_id);
 
