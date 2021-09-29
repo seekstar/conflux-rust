@@ -210,7 +210,7 @@ fn main() {
             &concat!(file!(), ":", line!(), ":", column!()),
         ),
     );
-    let (exec_items_sender, exec_items_receiver) = mpsc::channel();
+    let (exec_items_sender, exec_items_receiver) = mpsc::sync_channel(64);
     let epoch_to_execute_cloned = epoch_to_execute.clone();
     let _trace_reader_thread = std::thread::spawn(move || {
         read_trace(
@@ -508,7 +508,7 @@ fn main() {
 
 fn read_trace(
     trace_lines: Peekable<Lines<BufReader<File>>>,
-    exec_items_sender: mpsc::Sender<ExecItem>,
+    exec_items_sender: mpsc::SyncSender<ExecItem>,
     epoch_to_execute: Arc<AtomicU64>,
 ) {
     for line in trace_lines {
